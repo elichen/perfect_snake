@@ -48,15 +48,23 @@ Switched to 5-channel egocentric observation where grid is rotated so snake alwa
 
 ---
 
+### exp010 - 10x10 Rerun (Post-Cleanup)
+**Config:** board=10, egocentric + symmetric, network-scale=1, 50M steps, seed=42
+**Result:** 0% win rate (eval deterministic), score ~81.3
+
+**Note:** Another 0% run despite same config as exp006/007. Confirms high variance.
+
+---
+
 ## Phase 3: Scaling to 20x20 (In Progress)
 
-### exp008 - 20x20 with 1x Network
+### exp011 - 20x20 with 1x Network
 **Config:** board=20, egocentric + symmetric, network-scale=1, 100M steps
 **Status:** TODO
 
-### exp009 - 20x20 with 2x Network
+### exp012 - 20x20 with 2x Network
 **Config:** board=20, egocentric + symmetric, network-scale=2, 100M steps
-**Status:** TODO
+**Status:** IN PROGRESS
 
 ---
 
@@ -65,7 +73,7 @@ Switched to 5-channel egocentric observation where grid is rotated so snake alwa
 1. **Egocentric observation is critical** - Rotating grid so snake faces "up" reduces 4 direction cases to 1
 2. **Symmetric augmentation helps** - Horizontal flip provides effective data augmentation
 3. **Deterministic eval >> stochastic training** - 67% eval win rate vs 32% training win rate at same checkpoint
-4. **Run-to-run variance** - Same config can give different results due to MP non-determinism
+4. **HIGH VARIANCE** - Same config can give 0% or 100% win rate. exp006/007 achieved 67-100% wins, exp010 got 0%. Try multiple seeds.
 
 ## Network Architectures
 
