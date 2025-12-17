@@ -19,6 +19,56 @@ from pufferlib import pufferl
 from snake_env import SnakeEnv
 
 
+class SnakeSymmetricAugmentation(gym.Wrapper):
+    """Horizontal flip augmentation for Snake.
+
+    With probability `flip_prob`, flips the observation horizontally each episode.
+    When flipped:
+      - Observation columns are reversed
+      - For world-centric (9ch): direction channels swapped: right (ch4) ↔ left (ch6)
+      - For egocentric (5ch): no channel swap needed (already rotated)
+      - Actions swapped: left (0) ↔ right (2)
+    """
+
+    def __init__(self, env: gym.Env, flip_prob: float = 0.5, seed: int = 0):
+        super().__init__(env)
+        self.flip_prob = flip_prob
+        self.rng = np.random.default_rng(seed)
+        self.flipped = False
+        # Detect if egocentric (5 channels) or world-centric (9 channels)
+        self.egocentric = env.observation_space.shape[0] == 5
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        self.flipped = self.rng.random() < self.flip_prob
+        obs, info = self.env.reset(seed=seed, options=options)
+        if self.flipped:
+            obs = self._flip_obs(obs)
+        return obs, info
+
+    def step(self, action):
+        if self.flipped:
+            # Swap left (0) and right (2), keep straight (1)
+            if action == 0:
+                action = 2
+            elif action == 2:
+                action = 0
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        if self.flipped:
+            obs = self._flip_obs(obs)
+        return obs, reward, terminated, truncated, info
+
+    def _flip_obs(self, obs: np.ndarray) -> np.ndarray:
+        """Flip observation horizontally."""
+        obs = np.flip(obs, axis=2).copy()  # Flip columns
+        if not self.egocentric:
+            # World-centric: swap direction channels right (ch4) ↔ left (ch6)
+            obs[[4, 6]] = obs[[6, 4]]
+        # Egocentric: no channel swap needed (no direction channels)
+        return obs
+
+
 class SnakeEpisodeStats(gym.Wrapper):
     """Episode stats wrapper that logs final Snake score correctly.
 
@@ -59,9 +109,11 @@ class SnakeEpisodeStats(gym.Wrapper):
         return obs, reward, terminated, truncated, {}
 
 
-def make_snake_env(*, n: int, gamma: float, alpha: float, buf=None, seed=None):
+def make_snake_env(*, n: int, gamma: float, alpha: float, symmetric: bool = False, egocentric: bool = False, buf=None, seed=None):
     seed = 0 if seed is None else int(seed)
-    env = SnakeEnv(n=n, gamma=gamma, alpha=alpha, seed=seed)
+    env = SnakeEnv(n=n, gamma=gamma, alpha=alpha, seed=seed, egocentric=egocentric)
+    if symmetric:
+        env = SnakeSymmetricAugmentation(env, flip_prob=0.5, seed=seed)
     env = SnakeEpisodeStats(env)
     return pufferlib.emulation.GymnasiumPufferEnv(env, buf=buf)
 
@@ -227,7 +279,10 @@ def main():
     parser.add_argument("--eval-episodes", type=int, default=50)
     parser.add_argument("--eval-deterministic", action="store_true")
     parser.add_argument("--perfect-patience", type=int, default=0, help="0 = disable early stop")
+    parser.add_argument("--symmetric", action="store_true", help="Enable symmetric augmentation (50% horizontal flip)")
+    parser.add_argument("--egocentric", action="store_true", help="Use snake-centric observation (rotated so snake faces 'up')")
     parser.add_argument("--checkpoint-interval", type=int, default=200)
+    parser.add_argument("--exp-name", type=str, default=None, help="Experiment name (default: auto-generated)")
     parser.add_argument("--data-dir", type=str, default="experiments")
     parser.add_argument("--prio-alpha", type=float, default=0.8)
     parser.add_argument("--prio-beta0", type=float, default=0.2)
@@ -261,7 +316,7 @@ def main():
         physical = 1
     torch.set_num_threads(max(1, physical - (num_workers or 0)))
 
-    env_kwargs = dict(n=args.board_size, gamma=args.gamma, alpha=args.alpha)
+    env_kwargs = dict(n=args.board_size, gamma=args.gamma, alpha=args.alpha, symmetric=args.symmetric, egocentric=args.egocentric)
     vec_kwargs = dict(
         num_envs=args.num_envs,
         seed=args.seed,
@@ -289,7 +344,7 @@ def main():
             minibatch_size = batch_size
 
     config = {
-        "env": f"snake_{args.board_size}",
+        "env": args.exp_name if args.exp_name else f"snake_{args.board_size}",
         "seed": args.seed,
         "torch_deterministic": True,
         "cpu_offload": False,

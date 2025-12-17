@@ -1,12 +1,23 @@
 """Snake environment for RL training.
 
-Observation: 9-channel tensor (n+2, n+2) with wall border
+Two observation modes:
+
+WORLD-CENTRIC (egocentric=False, default): 9-channel tensor (n+2, n+2)
   - Ch 0: head (one-hot)
   - Ch 1: body (one-hot, includes head)
   - Ch 2: food (one-hot)
   - Ch 3-6: direction one-hot broadcast (up/right/down/left)
   - Ch 7: normalized length broadcast
   - Ch 8: walls (1 on border, 0 in playable area)
+
+SNAKE-CENTRIC (egocentric=True): 5-channel tensor (n+2, n+2)
+  Grid is rotated so snake always faces "up" (forward).
+  - Ch 0: head (one-hot)
+  - Ch 1: body (one-hot, includes head)
+  - Ch 2: food (one-hot)
+  - Ch 3: normalized length broadcast
+  - Ch 4: walls (1 on border, 0 in playable area)
+  No direction channels needed - direction is always implicitly "forward/up".
 
 Actions: 0=turn left, 1=straight, 2=turn right (relative)
 """
@@ -24,7 +35,9 @@ class SnakeEnv(gym.Env):
     """
     Snake game environment for RL training with FULL-BOARD observation.
 
-    Observation (float32): 9-channel grid ((n+2) x (n+2)) with wall border.
+    Observation (float32): Grid with wall border.
+      - egocentric=False: 9-channel (n+2) x (n+2), world coordinates
+      - egocentric=True: 5-channel (n+2) x (n+2), rotated so snake faces "up"
 
     Action space: Discrete(3)
         - 0: Turn left (relative)
@@ -52,6 +65,7 @@ class SnakeEnv(gym.Env):
         survival_bonus: float = 0.0,
         random_offset: bool = True,
         seed: Optional[int] = None,
+        egocentric: bool = False,
     ):
         super().__init__()
 
@@ -62,12 +76,13 @@ class SnakeEnv(gym.Env):
         self.alpha = alpha
         self.survival_bonus = survival_bonus
         self.random_offset = random_offset  # Placeholder for API compatibility
+        self.egocentric = egocentric
 
         # Action space: turn left, straight, turn right
         self.action_space = spaces.Discrete(3)
 
-        # Observation space: 9 channels, (n+2) x (n+2) with a wall border
-        self.n_channels = 9
+        # Observation space: 5 channels (egocentric) or 9 channels (world), (n+2) x (n+2)
+        self.n_channels = 5 if egocentric else 9
         self.obs_n = self.n + 2
         self.observation_space = spaces.Box(
             low=0.0,
@@ -131,7 +146,14 @@ class SnakeEnv(gym.Env):
             self.food_pos = (-1, -1)
 
     def _get_observation(self) -> np.ndarray:
-        obs = np.zeros((self.n_channels, self.obs_n, self.obs_n), dtype=np.float32)
+        if self.egocentric:
+            return self._get_observation_egocentric()
+        else:
+            return self._get_observation_world()
+
+    def _get_observation_world(self) -> np.ndarray:
+        """World-centric observation (9 channels, absolute coordinates)."""
+        obs = np.zeros((9, self.obs_n, self.obs_n), dtype=np.float32)
 
         # Channel 0: Head
         hr, hc = self.snake_head
@@ -155,6 +177,38 @@ class SnakeEnv(gym.Env):
 
         # Channel 8: Walls (constant padded border)
         obs[8, :, :] = self._walls
+
+        return obs
+
+    def _get_observation_egocentric(self) -> np.ndarray:
+        """Snake-centric observation (5 channels, rotated so snake faces 'up')."""
+        obs = np.zeros((5, self.obs_n, self.obs_n), dtype=np.float32)
+
+        # Channel 0: Head
+        hr, hc = self.snake_head
+        obs[0, hr + 1, hc + 1] = 1.0
+
+        # Channel 1: Body (includes head)
+        for r, c in self.snake:
+            obs[1, r + 1, c + 1] = 1.0
+
+        # Channel 2: Food
+        fr, fc = self.food_pos
+        if fr >= 0:
+            obs[2, fr + 1, fc + 1] = 1.0
+
+        # Channel 3: Normalized length (broadcast)
+        obs[3, :, :] = self.snake_length / float(self.n * self.n)
+
+        # Channel 4: Walls
+        obs[4, :, :] = self._walls
+
+        # Rotate so snake always faces "up" (direction 0)
+        # np.rot90(arr, k) rotates counter-clockwise by k*90 degrees
+        # direction: 0=up, 1=right, 2=down, 3=left
+        # To make direction face up: rotate by direction * 90 degrees CCW
+        if self.direction != 0:
+            obs = np.rot90(obs, k=self.direction, axes=(1, 2)).copy()
 
         return obs
 
