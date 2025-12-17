@@ -25,26 +25,22 @@ class SnakeSymmetricAugmentation(gym.Wrapper):
     With probability `flip_prob`, flips the observation horizontally each episode.
     When flipped:
       - Observation columns are reversed
-      - For world-centric (9ch): direction channels swapped: right (ch4) ↔ left (ch6)
-      - For egocentric (5ch): no channel swap needed (already rotated)
       - Actions swapped: left (0) ↔ right (2)
     """
 
     def __init__(self, env: gym.Env, flip_prob: float = 0.5, seed: int = 0):
         super().__init__(env)
         self.flip_prob = flip_prob
-        self.rng = np.random.default_rng(seed)
+        self.rng = np.random.default_rng(seed + 1)  # Different seed from env
         self.flipped = False
-        # Detect if egocentric (5 channels) or world-centric (9 channels)
-        self.egocentric = env.observation_space.shape[0] == 5
 
     def reset(self, *, seed=None, options=None):
         if seed is not None:
-            self.rng = np.random.default_rng(seed)
+            self.rng = np.random.default_rng(seed + 1)
         self.flipped = self.rng.random() < self.flip_prob
         obs, info = self.env.reset(seed=seed, options=options)
         if self.flipped:
-            obs = self._flip_obs(obs)
+            obs = np.flip(obs, axis=2).copy()
         return obs, info
 
     def step(self, action):
@@ -56,17 +52,8 @@ class SnakeSymmetricAugmentation(gym.Wrapper):
                 action = 0
         obs, reward, terminated, truncated, info = self.env.step(action)
         if self.flipped:
-            obs = self._flip_obs(obs)
+            obs = np.flip(obs, axis=2).copy()
         return obs, reward, terminated, truncated, info
-
-    def _flip_obs(self, obs: np.ndarray) -> np.ndarray:
-        """Flip observation horizontally."""
-        obs = np.flip(obs, axis=2).copy()  # Flip columns
-        if not self.egocentric:
-            # World-centric: swap direction channels right (ch4) ↔ left (ch6)
-            obs[[4, 6]] = obs[[6, 4]]
-        # Egocentric: no channel swap needed (no direction channels)
-        return obs
 
 
 class SnakeEpisodeStats(gym.Wrapper):
@@ -109,9 +96,9 @@ class SnakeEpisodeStats(gym.Wrapper):
         return obs, reward, terminated, truncated, {}
 
 
-def make_snake_env(*, n: int, gamma: float, alpha: float, symmetric: bool = False, egocentric: bool = False, buf=None, seed=None):
+def make_snake_env(*, n: int, gamma: float, alpha: float, symmetric: bool = False, buf=None, seed=None):
     seed = 0 if seed is None else int(seed)
-    env = SnakeEnv(n=n, gamma=gamma, alpha=alpha, seed=seed, egocentric=egocentric)
+    env = SnakeEnv(n=n, gamma=gamma, alpha=alpha, seed=seed)
     if symmetric:
         env = SnakeSymmetricAugmentation(env, flip_prob=0.5, seed=seed)
     env = SnakeEpisodeStats(env)
@@ -121,12 +108,11 @@ def make_snake_env(*, n: int, gamma: float, alpha: float, symmetric: bool = Fals
 class SnakePolicy(nn.Module):
     """FC policy for Snake.
 
-    Backbone: obs -> 1024 -> 512 -> 256 -> 128
-    Policy head: 128 -> 64 -> n_actions
-    Value head: 128 -> 128 -> 64 -> 1
+    Scale 1x (default): obs -> 1024 -> 512 -> 256 -> 128
+    Scale 2x: obs -> 2048 -> 1024 -> 512 -> 256
     """
 
-    def __init__(self, env):
+    def __init__(self, env, scale: int = 1):
         super().__init__()
 
         obs_space = getattr(env, "single_observation_space", env.observation_space)
@@ -135,33 +121,40 @@ class SnakePolicy(nn.Module):
         n_input = int(np.prod(obs_shape))
         n_actions = act_space.n
 
+        # Scale network width
+        w = [1024, 512, 256, 128]
+        if scale == 2:
+            w = [2048, 1024, 512, 256]
+        elif scale == 4:
+            w = [4096, 2048, 1024, 512]
+
         self.features = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(n_input, 1024),
-            nn.LayerNorm(1024),
+            nn.Linear(n_input, w[0]),
+            nn.LayerNorm(w[0]),
             nn.ReLU(),
-            nn.Linear(1024, 512),
-            nn.LayerNorm(512),
+            nn.Linear(w[0], w[1]),
+            nn.LayerNorm(w[1]),
             nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
+            nn.Linear(w[1], w[2]),
+            nn.LayerNorm(w[2]),
             nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(w[2], w[3]),
             nn.ReLU(),
         )
 
         self.policy_head = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(w[3], w[3] // 2),
             nn.ReLU(),
-            nn.Linear(64, n_actions),
+            nn.Linear(w[3] // 2, n_actions),
         )
 
         self.value_head = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(w[3], w[3]),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(w[3], w[3] // 2),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(w[3] // 2, 1),
         )
 
         self._init_weights()
@@ -280,7 +273,7 @@ def main():
     parser.add_argument("--eval-deterministic", action="store_true")
     parser.add_argument("--perfect-patience", type=int, default=0, help="0 = disable early stop")
     parser.add_argument("--symmetric", action="store_true", help="Enable symmetric augmentation (50% horizontal flip)")
-    parser.add_argument("--egocentric", action="store_true", help="Use snake-centric observation (rotated so snake faces 'up')")
+    parser.add_argument("--network-scale", type=int, default=1, choices=[1, 2, 4], help="Network width multiplier (1=base, 2=2x, 4=4x)")
     parser.add_argument("--checkpoint-interval", type=int, default=200)
     parser.add_argument("--exp-name", type=str, default=None, help="Experiment name (default: auto-generated)")
     parser.add_argument("--data-dir", type=str, default="experiments")
@@ -316,7 +309,7 @@ def main():
         physical = 1
     torch.set_num_threads(max(1, physical - (num_workers or 0)))
 
-    env_kwargs = dict(n=args.board_size, gamma=args.gamma, alpha=args.alpha, symmetric=args.symmetric, egocentric=args.egocentric)
+    env_kwargs = dict(n=args.board_size, gamma=args.gamma, alpha=args.alpha, symmetric=args.symmetric)
     vec_kwargs = dict(
         num_envs=args.num_envs,
         seed=args.seed,
@@ -327,7 +320,7 @@ def main():
         vec_kwargs["num_workers"] = num_workers
     vecenv = pufferlib.vector.make(make_snake_env, **vec_kwargs)
 
-    policy = SnakePolicy(vecenv.driver_env).to(args.device)
+    policy = SnakePolicy(vecenv.driver_env, scale=args.network_scale).to(args.device)
     if args.resume:
         state = torch.load(args.resume, map_location="cpu")
         policy.load_state_dict(state, strict=True)

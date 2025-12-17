@@ -11,21 +11,22 @@
 python -m venv .venv && source .venv/bin/activate
 pip install torch gymnasium numpy pufferlib psutil
 
-# Train (basic)
-python train.py --board-size 10 --timesteps 10000000 --device mps
+# Train 10x10 with symmetric augmentation (recommended)
+python train.py --board-size 10 --timesteps 50000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --device mps
 
-# Train (full 20x20 target)
-python train.py --board-size 20 --timesteps 50000000 --num-envs 256 --backend mp --device mps
+# Train 20x20 target
+python train.py --board-size 20 --timesteps 100000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --device mps
 
-# Deterministic training (for reproducibility)
-python train.py --backend serial --seed 42
+# Evaluate checkpoint
+python eval.py experiments/checkpoint.pt --board-size 10 --episodes 100 --deterministic --device mps
 ```
 
 ## Architecture
 
 ### Files
 - `train.py` - Main training script with PPO via PufferLib
-- `snake_env.py` - Gymnasium Snake environment implementation
+- `snake_env.py` - Gymnasium Snake environment (egocentric observation)
+- `eval.py` - Checkpoint evaluation script
 
 ### Neural Network (SnakePolicy)
 - FC backbone: 1024 → 512 → 256 → 128
@@ -33,8 +34,9 @@ python train.py --backend serial --seed 42
 - Value head: 128 → 128 → 64 → 1
 
 ### Environment
-- **Observation**: 9-channel grid (board_size+2 x board_size+2)
-  - Channels: head, body, food, direction (4), normalized length, walls
+- **Observation**: 5-channel grid (board_size+2 x board_size+2), snake-centric (egocentric)
+  - Grid rotated so snake always faces "up"
+  - Channels: head, body, food, normalized length, walls
 - **Actions**: 3 discrete (turn left, straight, turn right) - relative to current direction
 - **Rewards**: +1 food, -1 death, -0.5 stall, distance shaping (alpha=0.2)
 
@@ -46,26 +48,28 @@ python train.py --backend serial --seed 42
 | `--timesteps` | 1M | Total training steps |
 | `--num-envs` | 64 | Parallel environments |
 | `--horizon` | 128 | Steps per env per epoch |
+| `--minibatch-size` | auto | SGD minibatch size |
+| `--symmetric` | off | Enable horizontal flip augmentation |
+| `--network-scale` | 1 | Network width multiplier (1, 2, or 4) |
 | `--lr` | 3e-4 | Learning rate |
 | `--gamma` | 0.99 | Discount factor |
 | `--alpha` | 0.2 | Distance shaping coefficient |
 | `--backend` | mp | `mp` (multiprocessing) or `serial` |
 | `--device` | cpu | `cpu`, `cuda`, or `mps` |
+| `--eval-every-steps` | 0 | Run deterministic eval every N steps |
+| `--eval-deterministic` | off | Use argmax for periodic eval |
+| `--eval-episodes` | 50 | Episodes per eval |
 
-## Known Issues
+## Results
 
-- **Non-determinism**: Multiprocessing backend (`--backend mp`) causes run-to-run variance even with same seed. Use `--backend serial` for reproducible experiments.
-- **Variance**: Experiments show high variance (70-80% win rate in one run, 0% in another with same config)
+Best config (10x10, egocentric + symmetric augmentation):
+- **100% win rate** at ~26M steps
+- **67% win rate** at 10M steps (eval with deterministic policy)
 
-## Experiment Tracking
-
-See `EXPERIMENTS.md` for detailed experiment log. Key findings:
-- Baseline 10x10: High variance, best run achieved 70-80% win rate
-- Larger networks underperformed
-- Symmetric augmentation hurt performance
+**Note:** High run-to-run variance due to MP non-determinism. Same config may produce 0% or 70%+ wins. Try different seeds if a run fails.
 
 ## Output
 
 Training outputs go to `experiments/` directory:
-- `model_*.pt` - Periodic checkpoints
-- `trainer_state.pt` - Training state snapshot
+- `{exp_name}_{timestamp}.pt` - Final checkpoint
+- Periodic checkpoints every 200 epochs

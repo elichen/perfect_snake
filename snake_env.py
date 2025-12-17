@@ -1,23 +1,12 @@
 """Snake environment for RL training.
 
-Two observation modes:
-
-WORLD-CENTRIC (egocentric=False, default): 9-channel tensor (n+2, n+2)
-  - Ch 0: head (one-hot)
-  - Ch 1: body (one-hot, includes head)
-  - Ch 2: food (one-hot)
-  - Ch 3-6: direction one-hot broadcast (up/right/down/left)
-  - Ch 7: normalized length broadcast
-  - Ch 8: walls (1 on border, 0 in playable area)
-
-SNAKE-CENTRIC (egocentric=True): 5-channel tensor (n+2, n+2)
+Observation: 5-channel tensor (n+2, n+2), snake-centric (egocentric)
   Grid is rotated so snake always faces "up" (forward).
   - Ch 0: head (one-hot)
   - Ch 1: body (one-hot, includes head)
   - Ch 2: food (one-hot)
   - Ch 3: normalized length broadcast
   - Ch 4: walls (1 on border, 0 in playable area)
-  No direction channels needed - direction is always implicitly "forward/up".
 
 Actions: 0=turn left, 1=straight, 2=turn right (relative)
 """
@@ -33,11 +22,10 @@ import numpy as np
 
 class SnakeEnv(gym.Env):
     """
-    Snake game environment for RL training with FULL-BOARD observation.
+    Snake game environment for RL training.
 
-    Observation (float32): Grid with wall border.
-      - egocentric=False: 9-channel (n+2) x (n+2), world coordinates
-      - egocentric=True: 5-channel (n+2) x (n+2), rotated so snake faces "up"
+    Observation (float32): 5-channel (n+2) x (n+2), snake-centric (egocentric).
+    Grid is rotated so snake always faces "up".
 
     Action space: Discrete(3)
         - 0: Turn left (relative)
@@ -63,9 +51,7 @@ class SnakeEnv(gym.Env):
         gamma: float = 0.995,
         alpha: float = 0.2,
         survival_bonus: float = 0.0,
-        random_offset: bool = True,
         seed: Optional[int] = None,
-        egocentric: bool = False,
     ):
         super().__init__()
 
@@ -75,14 +61,12 @@ class SnakeEnv(gym.Env):
         self.gamma = gamma
         self.alpha = alpha
         self.survival_bonus = survival_bonus
-        self.random_offset = random_offset  # Placeholder for API compatibility
-        self.egocentric = egocentric
 
         # Action space: turn left, straight, turn right
         self.action_space = spaces.Discrete(3)
 
-        # Observation space: 5 channels (egocentric) or 9 channels (world), (n+2) x (n+2)
-        self.n_channels = 5 if egocentric else 9
+        # Observation space: 5 channels (egocentric), (n+2) x (n+2)
+        self.n_channels = 5
         self.obs_n = self.n + 2
         self.observation_space = spaces.Box(
             low=0.0,
@@ -146,41 +130,6 @@ class SnakeEnv(gym.Env):
             self.food_pos = (-1, -1)
 
     def _get_observation(self) -> np.ndarray:
-        if self.egocentric:
-            return self._get_observation_egocentric()
-        else:
-            return self._get_observation_world()
-
-    def _get_observation_world(self) -> np.ndarray:
-        """World-centric observation (9 channels, absolute coordinates)."""
-        obs = np.zeros((9, self.obs_n, self.obs_n), dtype=np.float32)
-
-        # Channel 0: Head
-        hr, hc = self.snake_head
-        obs[0, hr + 1, hc + 1] = 1.0
-
-        # Channel 1: Body (includes head, matching web agent)
-        for r, c in self.snake:
-            obs[1, r + 1, c + 1] = 1.0
-
-        # Channel 2: Food
-        fr, fc = self.food_pos
-        if fr >= 0:
-            obs[2, fr + 1, fc + 1] = 1.0
-
-        # Channels 3-6: Direction one-hot (broadcast)
-        dir_channel = 3 + int(self.direction)
-        obs[dir_channel, :, :] = 1.0
-
-        # Channel 7: Normalized length (broadcast)
-        obs[7, :, :] = self.snake_length / float(self.n * self.n)
-
-        # Channel 8: Walls (constant padded border)
-        obs[8, :, :] = self._walls
-
-        return obs
-
-    def _get_observation_egocentric(self) -> np.ndarray:
         """Snake-centric observation (5 channels, rotated so snake faces 'up')."""
         obs = np.zeros((5, self.obs_n, self.obs_n), dtype=np.float32)
 

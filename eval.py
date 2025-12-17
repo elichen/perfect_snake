@@ -15,41 +15,48 @@ from snake_env import SnakeEnv
 class SnakePolicy(nn.Module):
     """FC policy for Snake (must match train.py architecture)."""
 
-    def __init__(self, board_size: int, egocentric: bool = False):
+    def __init__(self, board_size: int, scale: int = 1):
         super().__init__()
 
-        n_channels = 5 if egocentric else 9
+        n_channels = 5
         obs_shape = (n_channels, board_size + 2, board_size + 2)
         n_input = int(np.prod(obs_shape))
         n_actions = 3
 
+        # Scale network width
+        w = [1024, 512, 256, 128]
+        if scale == 2:
+            w = [2048, 1024, 512, 256]
+        elif scale == 4:
+            w = [4096, 2048, 1024, 512]
+
         self.features = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(n_input, 1024),
-            nn.LayerNorm(1024),
+            nn.Linear(n_input, w[0]),
+            nn.LayerNorm(w[0]),
             nn.ReLU(),
-            nn.Linear(1024, 512),
-            nn.LayerNorm(512),
+            nn.Linear(w[0], w[1]),
+            nn.LayerNorm(w[1]),
             nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
+            nn.Linear(w[1], w[2]),
+            nn.LayerNorm(w[2]),
             nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(w[2], w[3]),
             nn.ReLU(),
         )
 
         self.policy_head = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(w[3], w[3] // 2),
             nn.ReLU(),
-            nn.Linear(64, n_actions),
+            nn.Linear(w[3] // 2, n_actions),
         )
 
         self.value_head = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(w[3], w[3]),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(w[3], w[3] // 2),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(w[3] // 2, 1),
         )
 
     def forward(self, observations, state=None):
@@ -67,19 +74,19 @@ def evaluate_checkpoint(
     seed: int,
     deterministic: bool,
     device: str,
-    egocentric: bool = False,
+    network_scale: int = 1,
     verbose: bool = False,
 ) -> dict:
     """Load checkpoint and evaluate."""
 
     # Load policy
-    policy = SnakePolicy(board_size, egocentric=egocentric).to(device)
+    policy = SnakePolicy(board_size, scale=network_scale).to(device)
     state_dict = torch.load(checkpoint_path, map_location=device)
     policy.load_state_dict(state_dict, strict=True)
     policy.eval()
 
     # Create env
-    env = SnakeEnv(n=board_size, gamma=0.99, alpha=0.2, seed=seed, egocentric=egocentric)
+    env = SnakeEnv(n=board_size, gamma=0.99, alpha=0.2, seed=seed)
     perfect_score = board_size * board_size - 3
 
     scores = []
@@ -138,13 +145,13 @@ def main():
     parser.add_argument("--episodes", type=int, default=100, help="Number of episodes (default: 100)")
     parser.add_argument("--seed", type=int, default=12345, help="Random seed for evaluation")
     parser.add_argument("--deterministic", action="store_true", help="Use argmax instead of sampling")
-    parser.add_argument("--egocentric", action="store_true", help="Use snake-centric observation (must match training)")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda", "mps"])
+    parser.add_argument("--network-scale", type=int, default=1, choices=[1, 2, 4], help="Network width multiplier (must match training)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print per-episode results")
     args = parser.parse_args()
 
     print(f"Evaluating: {args.checkpoint}")
-    print(f"  board_size={args.board_size}, episodes={args.episodes}, deterministic={args.deterministic}, egocentric={args.egocentric}")
+    print(f"  board_size={args.board_size}, episodes={args.episodes}, deterministic={args.deterministic}")
     print()
 
     try:
@@ -155,7 +162,7 @@ def main():
             seed=args.seed,
             deterministic=args.deterministic,
             device=args.device,
-            egocentric=args.egocentric,
+            network_scale=args.network_scale,
             verbose=args.verbose,
         )
     except Exception as e:
