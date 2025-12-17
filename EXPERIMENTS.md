@@ -45,21 +45,31 @@ Initial experiments on 10x10 grid to validate approach before scaling to 20x20.
 
 ---
 
-### exp004 - Symmetric Augmentation (planned)
-**Hypothesis:** Left-right symmetry augmentation (50% random horizontal flip per episode) should improve sample efficiency.
+### exp004 - Symmetric Augmentation
+**Config:** board=10, baseline network, 50% random horizontal flip per episode
 
 **Implementation:**
 - Flip observation horizontally
 - Swap direction channels: right ↔ left
 - Swap actions: left ↔ right
 
-**Status:** Ready to test
+**Results @ 50M steps:** 0% win rate, score ~74-82, 43k SPS
+
+**Conclusion:** Symmetric augmentation hurt performance significantly. Baseline achieved 70-80% wins at 10M steps; this achieved 0% wins at 50M steps. Possible issues:
+- Per-episode flip may confuse learning (inconsistent world views across episodes)
+- Implementation bug in flip logic?
+- Augmentation may not be beneficial for this problem
 
 ---
 
 ## Key Findings
 
-1. Baseline network (1024→512→256→128) achieves ~70-80% win rate on 10x10
+1. Baseline network (1024→512→256→128) achieves ~70-80% win rate on 10x10 at 10M steps
 2. Doubling network size hurts performance (0% wins at 22M steps)
-3. High run-to-run variance despite fixed seed (MP non-determinism)
-4. Next steps: validate symmetric augmentation, then scale to 20x20
+3. Symmetric augmentation hurts performance (0% wins at 50M steps)
+4. High run-to-run variance despite fixed seed (MP non-determinism)
+
+## Next Steps
+
+- Run baseline to completion (50M steps) to establish true ceiling
+- Scale to 20x20 once 10x10 is solved
