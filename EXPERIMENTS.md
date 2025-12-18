@@ -73,6 +73,16 @@ Switched to 5-channel egocentric observation where grid is rotated so snake alwa
 
 **Note:** Learning is happening but slow. 39% of perfect at 100M steps suggests need for longer training or architectural changes.
 
+### exp013 - 20x20 with Horizon=512, LR=1e-4
+**Config:** board=20, egocentric + symmetric, network-scale=2, horizon=512, lr=1e-4, 82M steps (stopped early)
+**Result:** 0% win rate, eval score 63.2/397 (16%), ~18k SPS
+
+**Comparison with exp012 at similar steps:**
+- exp012 @ 75M: score 63 (16%)
+- exp013 @ 82M: score 63 (16%)
+
+**Conclusion:** Longer horizon + lower LR did NOT help. Same performance with more steps. The horizon=128 with lr=3e-4 was actually more efficient.
+
 ---
 
 ## Key Findings
@@ -80,7 +90,9 @@ Switched to 5-channel egocentric observation where grid is rotated so snake alwa
 1. **Egocentric observation is critical** - Rotating grid so snake faces "up" reduces 4 direction cases to 1
 2. **Symmetric augmentation helps** - Horizontal flip provides effective data augmentation
 3. **Deterministic eval >> stochastic training** - 67% eval win rate vs 32% training win rate at same checkpoint
-4. **HIGH VARIANCE** - Same config can give 0% or 100% win rate. exp006/007 achieved 67-100% wins, exp010 got 0%. Try multiple seeds.
+4. **HIGH VARIANCE on 10x10** - Same config can give 0% or 100% win rate. Try multiple seeds.
+5. **20x20 is much harder** - Best result: 39% of perfect score at 100M steps (exp012)
+6. **Horizon=512 didn't help** - exp013 showed no improvement over horizon=128
 
 ## Network Architectures
 
