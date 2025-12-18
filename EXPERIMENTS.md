@@ -63,8 +63,15 @@ Switched to 5-channel egocentric observation where grid is rotated so snake alwa
 **Status:** TODO
 
 ### exp012 - 20x20 with 2x Network
-**Config:** board=20, egocentric + symmetric, network-scale=2, 100M steps
-**Status:** IN PROGRESS
+**Config:** board=20, egocentric + symmetric, network-scale=2, horizon=128, 100M steps, seed=42
+**Result:** 0% win rate, eval score 155.6/397 (39%), ~20k SPS
+
+**Progression:**
+- 50M steps: score ~51 (13%)
+- 75M steps: score ~63 (16%)
+- 100M steps: score ~156 (39%)
+
+**Note:** Learning is happening but slow. 39% of perfect at 100M steps suggests need for longer training or architectural changes.
 
 ---
 
