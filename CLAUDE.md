@@ -17,6 +17,12 @@ python train.py --board-size 10 --timesteps 50000000 --num-envs 256 --horizon 12
 # Train 20x20 target
 python train.py --board-size 20 --timesteps 100000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --device mps
 
+# List tracked experiments
+python experiments.py list
+
+# Inspect a specific run (prefix or full directory name)
+python experiments.py show exp014_20x20_4x_176601447103
+
 # Evaluate checkpoint
 python eval.py experiments/checkpoint.pt --board-size 10 --episodes 100 --deterministic --device mps
 ```
@@ -25,6 +31,8 @@ python eval.py experiments/checkpoint.pt --board-size 10 --episodes 100 --determ
 
 ### Files
 - `train.py` - Main training script with PPO via PufferLib
+- `experiment_tracker.py` - Writes run metadata, metrics, evals, and checkpoints
+- `experiments.py` - CLI to list/show tracked experiments
 - `snake_env.py` - Gymnasium Snake environment (egocentric observation)
 - `eval.py` - Checkpoint evaluation script
 
@@ -71,5 +79,10 @@ Best config (10x10, egocentric + symmetric augmentation):
 ## Output
 
 Training outputs go to `experiments/` directory:
-- `{exp_name}_{timestamp}.pt` - Final checkpoint
-- Periodic checkpoints every 200 epochs
+- `{exp_name}_{run_id}.pt` - Final checkpoint (copied on close)
+- `{exp_name}_{run_id}/` - Run directory with:
+  - `run.json` (run metadata + config)
+  - `metrics.jsonl` (train/eval/checkpoint events)
+  - `summary.json` (best/last eval + final checkpoint)
+  - `trainer_state.pt` and `model_*.pt` checkpoints
+- `index.jsonl` - Append-only run index across experiments

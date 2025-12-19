@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shlex
+import sys
 import time
 
 import gymnasium as gym
@@ -17,6 +20,7 @@ import pufferlib.vector
 from pufferlib import pufferl
 
 from snake_env import SnakeEnv
+from experiment_tracker import ExperimentTracker
 
 
 class SnakeSymmetricAugmentation(gym.Wrapper):
@@ -233,6 +237,26 @@ def evaluate_policy(
     }
 
 
+def _format_command() -> str:
+    parts = [sys.executable] + sys.argv
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if hasattr(value, "item"):
+            value = value.item()
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _get_agent_steps(logs, trainer) -> int:
+    if logs is not None and "agent_steps" in logs:
+        return _safe_int(logs["agent_steps"], 0)
+    return _safe_int(getattr(trainer, "global_step", 0), 0)
+
+
 def main():
     parser = argparse.ArgumentParser(description="PufferLib PPO on Snake")
     parser.add_argument("--board-size", type=int, default=20)
@@ -379,6 +403,20 @@ def main():
     if not args.dashboard:
         trainer.print_dashboard = lambda *_, **__: None
 
+    tracker = None
+    try:
+        tracker = ExperimentTracker(
+            exp_name=config["env"],
+            run_id=trainer.logger.run_id,
+            data_dir=config["data_dir"],
+            args=vars(args),
+            config=config,
+            command=_format_command(),
+            cwd=os.getcwd(),
+        )
+    except Exception as exc:
+        print(f"experiment_tracker_disabled: {exc}", file=sys.stderr)
+
     start_time = time.time()
     last_logs = None
     last_eval_at = 0
@@ -389,7 +427,9 @@ def main():
         if logs is not None:
             last_logs = logs
             sps = logs.get("SPS", 0)
-            agent_steps = logs.get("agent_steps", 0)
+            agent_steps = _get_agent_steps(logs, trainer)
+            if tracker is not None:
+                tracker.log_train(logs)
             ep_ret = logs.get("environment/episode_return", None)
             ep_len = logs.get("environment/episode_length", None)
             ep_score = logs.get("environment/episode_score", None)
@@ -432,6 +472,13 @@ def main():
                     f"eval: mean_score={mean_score:.2f}/{perfect_score} win_rate={win_rate*100:.1f}% "
                     f"({stats['episodes']} eps)"
                 )
+                if tracker is not None:
+                    tracker.log_eval(
+                        stats,
+                        agent_steps=agent_steps,
+                        epoch=trainer.epoch,
+                        deterministic=args.eval_deterministic,
+                    )
 
                 if args.perfect_patience > 0 and win_rate >= 1.0:
                     perfect_streak += 1
@@ -443,10 +490,31 @@ def main():
                 else:
                     perfect_streak = 0
 
-    trainer.close()
+        if tracker is not None:
+            checkpoint_interval = int(args.checkpoint_interval)
+            if checkpoint_interval > 0 and (
+                trainer.epoch % checkpoint_interval == 0 or trainer.epoch >= trainer.total_epochs
+            ):
+                agent_steps = _get_agent_steps(last_logs, trainer)
+                checkpoint_path = os.path.join(
+                    tracker.run_dir, f"model_{config['env']}_{trainer.epoch:06d}.pt"
+                )
+                tracker.log_checkpoint(
+                    checkpoint_path,
+                    epoch=trainer.epoch,
+                    agent_steps=agent_steps,
+                )
+
+    final_checkpoint = trainer.close()
     elapsed = time.time() - start_time
+    if tracker is not None:
+        tracker.finalize(
+            status="completed",
+            final_checkpoint=final_checkpoint,
+            elapsed_seconds=elapsed,
+        )
     if last_logs is not None and elapsed > 0:
-        agent_steps = int(last_logs.get("agent_steps", 0))
+        agent_steps = _safe_int(last_logs.get("agent_steps", 0), 0)
         print(f"avg_SPS={agent_steps/elapsed:,.0f} (steps={agent_steps:,}, seconds={elapsed:.1f})")
 
 
