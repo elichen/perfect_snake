@@ -17,6 +17,9 @@ python train.py --board-size 10 --timesteps 50000000 --num-envs 256 --horizon 12
 # Train 20x20 target
 python train.py --board-size 20 --timesteps 100000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --device mps
 
+# Resume training with optimizer/state (adds steps)
+python train.py --board-size 20 --timesteps 50000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --network-scale 2 --device mps --resume-state experiments/exp016_20x20_2x_seed3_176618092705/trainer_state.pt --resume-add-steps --exp-name exp016_20x20_2x_seed3_resume
+
 # List tracked experiments
 python experiments.py list
 

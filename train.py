@@ -305,6 +305,17 @@ def main():
     parser.add_argument("--prio-beta0", type=float, default=0.2)
     parser.add_argument("--resume", type=str, default=None, help="Path to a saved .pt state_dict")
     parser.add_argument(
+        "--resume-state",
+        type=str,
+        default=None,
+        help="Path to trainer_state.pt (restores optimizer, epoch, global_step)",
+    )
+    parser.add_argument(
+        "--resume-add-steps",
+        action="store_true",
+        help="When resuming, add --timesteps to the saved global_step",
+    )
+    parser.add_argument(
         "--dashboard",
         action="store_true",
         help="Enable PufferLib rich dashboard output (off by default for benchmarking)",
@@ -315,6 +326,20 @@ def main():
         raise SystemExit("--num-envs must be >= 1")
     if args.horizon < 1:
         raise SystemExit("--horizon must be >= 1")
+
+    resume_state = None
+    resume_steps = 0
+    resume_epoch = 0
+    resume_state_path = args.resume_state
+    if resume_state_path is not None:
+        if not os.path.exists(resume_state_path):
+            raise SystemExit(f"--resume-state not found: {resume_state_path}")
+        try:
+            resume_state = torch.load(resume_state_path, map_location="cpu")
+        except Exception as exc:
+            raise SystemExit(f"--resume-state load failed: {exc}") from exc
+        resume_steps = int(resume_state.get("global_step", 0))
+        resume_epoch = int(resume_state.get("update", 0))
 
     backend = pufferlib.vector.Multiprocessing if args.backend == "mp" else pufferlib.vector.Serial
     num_workers = int(args.num_workers)
@@ -348,6 +373,15 @@ def main():
     if args.resume:
         state = torch.load(args.resume, map_location="cpu")
         policy.load_state_dict(state, strict=True)
+    elif resume_state is not None:
+        model_name = resume_state.get("model_name")
+        if model_name:
+            resume_model = os.path.join(os.path.dirname(resume_state_path), model_name)
+            if os.path.exists(resume_model):
+                state = torch.load(resume_model, map_location="cpu")
+                policy.load_state_dict(state, strict=True)
+            else:
+                print(f"warning: resume model not found: {resume_model}", file=sys.stderr)
 
     batch_size = args.num_envs * args.horizon
     if args.minibatch_size > 0:
@@ -360,6 +394,15 @@ def main():
         if minibatch_size > batch_size:
             minibatch_size = batch_size
 
+    total_timesteps = int(args.timesteps)
+    if resume_state is not None and args.resume_add_steps:
+        total_timesteps = resume_steps + total_timesteps
+    elif resume_state is not None and resume_steps >= total_timesteps:
+        print(
+            f"warning: resume global_step ({resume_steps}) >= total_timesteps ({total_timesteps})",
+            file=sys.stderr,
+        )
+
     config = {
         "env": args.exp_name if args.exp_name else f"snake_{args.board_size}",
         "seed": args.seed,
@@ -368,7 +411,7 @@ def main():
         "device": args.device,
         "optimizer": "adam",
         "precision": "float32",
-        "total_timesteps": int(args.timesteps),
+        "total_timesteps": int(total_timesteps),
         "learning_rate": float(args.lr),
         "anneal_lr": not bool(args.no_anneal_lr),
         "min_lr_ratio": float(args.min_lr_ratio),
@@ -402,6 +445,19 @@ def main():
     trainer = pufferl.PuffeRL(config, vecenv, policy)
     if not args.dashboard:
         trainer.print_dashboard = lambda *_, **__: None
+
+    if resume_state is not None:
+        if "optimizer_state_dict" in resume_state:
+            trainer.optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+        trainer.global_step = resume_steps
+        trainer.epoch = resume_epoch
+        trainer.last_log_step = resume_steps
+        trainer.last_log_time = time.time()
+        try:
+            trainer.scheduler.last_epoch = resume_epoch
+        except Exception:
+            pass
+        print(f"resume_state: steps={resume_steps} epoch={resume_epoch}", file=sys.stderr)
 
     tracker = None
     try:
