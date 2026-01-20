@@ -52,15 +52,21 @@ class SnakeEnv(gym.Env):
         alpha: float = 0.2,
         survival_bonus: float = 0.0,
         seed: Optional[int] = None,
+        stall_penalty: float = -1.0,
+        stall_terminates: bool = True,
+        max_no_food_base: Optional[int] = None,
     ):
         super().__init__()
 
         self.n = n
-        self.max_no_food_base = max_no_food
+        # Support both old 'max_no_food' and new 'max_no_food_base' parameter names
+        self._max_no_food_override = max_no_food_base if max_no_food_base is not None else max_no_food
         self.render_mode = render_mode
         self.gamma = gamma
         self.alpha = alpha
         self.survival_bonus = survival_bonus
+        self.stall_penalty = stall_penalty
+        self.stall_terminates = stall_terminates
 
         # Action space: turn left, straight, turn right
         self.action_space = spaces.Discrete(3)
@@ -101,18 +107,23 @@ class SnakeEnv(gym.Env):
 
     @property
     def max_no_food(self) -> int:
-        if self.max_no_food_base is not None:
-            return self.max_no_food_base
+        if self._max_no_food_override is not None:
+            return self._max_no_food_override
         return max(80 + 4 * self.snake_length, 2 * self.n * self.n)
 
     def _manhattan_distance(self, a: Tuple[int, int], b: Tuple[int, int]) -> int:
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     def _compute_phi(self) -> float:
+        # Decay alpha as snake grows - late game needs less shaping
+        # because optimal paths often require moving away from food first
+        progress = self.snake_length / (self.n * self.n)
+        alpha_eff = self.alpha * (1 - progress)
+
         d = self._manhattan_distance(self.snake_head, self.food_pos)
         max_d = 2 * (self.n - 1)
         d_norm = d / max_d if max_d > 0 else 0.0
-        return -self.alpha * d_norm
+        return -alpha_eff * d_norm
 
     def _place_food(self) -> None:
         snake_set = set(self.snake)
@@ -255,8 +266,11 @@ class SnakeEnv(gym.Env):
                 self.steps_since_food += 1
 
         if not terminated and self.steps_since_food > self.max_no_food:
-            truncated = True
-            base_reward += -0.5
+            if self.stall_terminates:
+                terminated = True  # Proper termination - PPO won't bootstrap
+            else:
+                truncated = True  # Old behavior - PPO bootstraps (underpenalizes)
+            base_reward += self.stall_penalty
             reason = "stall"
 
         if not terminated:

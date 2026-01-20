@@ -120,16 +120,60 @@ Tested GRPO (Group Relative Policy Optimization) from DeepSeekMath as an alterna
 
 ---
 
+## Phase 5: Breaking the 40% Plateau (In Progress)
+
+Both exp012 and exp013 plateau at ~39% (score ~155/397). Investigating why.
+
+### exp022 - Stall Handling Fix
+**Hypothesis:** Stall penalty (-0.5) and truncation (not termination) underpenalizes stalling. Agent learns to wander instead of pursuing food aggressively.
+
+**Changes:**
+- `stall_penalty`: -0.5 → -1.0 (same as death)
+- `stall_terminates`: True (terminated, not truncated - PPO won't bootstrap)
+
+**Config:** board=20, network-scale=2, symmetric, 100M steps
+**Result:** 0% win rate, eval score **154.5/397 (39%)**
+
+**Eval progression:**
+| Steps | Score | % |
+|-------|-------|---|
+| 10M | 42.8 | 11% |
+| 20M | 40.7 | 10% |
+| 30M | 63.0 | 16% |
+| 40M | 81.7 | 21% |
+| 50M | 56.1 | 14% |
+| 60M | 119.8 | 30% |
+| 70M | 132.9 | 33% |
+| 80M | 69.0 | 17% |
+| 90M | 154.5 | 39% |
+
+**Conclusion:** Stall fix did NOT break the plateau. Same ~39% result as exp012. High eval variance (10 episodes too few).
+
+### exp023 - Alpha Decay (Running)
+**Hypothesis:** Distance shaping (alpha=0.2) hurts late-game. Optimal paths often require moving AWAY from food first (to navigate around body). Constant shaping fights this.
+
+**Changes:**
+- Alpha now decays with snake length: `alpha_eff = alpha * (1 - length/board_area)`
+- At length 3: α=0.199 (full shaping)
+- At length 160 (40%): α=0.12 (reduced)
+- At length 300 (75%): α=0.05 (minimal)
+
+**Config:** board=20, network-scale=2, symmetric, 100M steps
+**Status:** Running
+
+---
+
 ## Key Findings
 
 1. **Egocentric observation is critical** - Rotating grid so snake faces "up" reduces 4 direction cases to 1
 2. **Symmetric augmentation helps** - Horizontal flip provides effective data augmentation
 3. **Deterministic eval >> stochastic training** - 67% eval win rate vs 32% training win rate at same checkpoint
 4. **HIGH VARIANCE on 10x10** - Same config can give 0% or 100% win rate. Try multiple seeds.
-5. **20x20 is much harder** - Best result: 39% of perfect score at 100M steps (exp012)
+5. **20x20 plateaus at 39%** - exp012, exp022 both hit score ~155/397 wall at 100M steps
 6. **Horizon=512 didn't help** - exp013 showed no improvement over horizon=128
 7. **GRPO doesn't work for Snake** - 60-400x worse sample efficiency than PPO. Value function is essential for dense-reward MDPs
-8. **Resume feature abandoned** - `--resume-state` for checkpoint resumption had scheduler/LR issues. Start fresh runs instead
+8. **Stall handling didn't help** - exp022 showed same plateau despite proper termination and -1.0 penalty
+9. **10-episode evals too noisy** - exp022 showed score jumping from 133→69→154 between evals
 
 ## Network Architectures
 
@@ -142,12 +186,23 @@ Tested GRPO (Group Relative Policy Optimization) from DeepSeekMath as an alterna
 ## Commands
 
 ```bash
-# 10x10 baseline (recommended)
-python train.py --board-size 10 --timesteps 50000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --device mps --eval-every-steps 1000000 --eval-deterministic --eval-episodes 10
+# Current experiment (alpha decay)
+python train.py --board-size 20 --timesteps 100000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --network-scale 2 --device mps --eval-every-steps 5000000 --eval-deterministic --eval-episodes 10 --exp-name exp023_alpha_decay
 
-# 20x20 with 2x network
+# 10x10 baseline (for testing changes)
+python train.py --board-size 10 --timesteps 50000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --device mps --eval-every-steps 5000000 --eval-deterministic --eval-episodes 10
+
+# 20x20 baseline (before alpha decay)
 python train.py --board-size 20 --timesteps 100000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --network-scale 2 --device mps --eval-every-steps 5000000 --eval-deterministic --eval-episodes 10
 
 # Evaluate checkpoint
-python eval.py experiments/checkpoint.pt --board-size 10 --episodes 100 --deterministic --device mps
+python eval.py experiments/checkpoint.pt --board-size 20 --episodes 100 --deterministic --device mps
 ```
+
+## Next Experiments to Try
+
+If alpha decay doesn't help:
+1. **Tail channel** - Add 6th observation channel showing tail position
+2. **4x network** - More capacity (14.5M params vs 4.4M)
+3. **Gamma 0.995** - Longer horizon for credit assignment
+4. **More eval episodes** - 30+ to reduce variance

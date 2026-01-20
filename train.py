@@ -100,9 +100,28 @@ class SnakeEpisodeStats(gym.Wrapper):
         return obs, reward, terminated, truncated, {}
 
 
-def make_snake_env(*, n: int, gamma: float, alpha: float, symmetric: bool = False, buf=None, seed=None):
+def make_snake_env(
+    *,
+    n: int,
+    gamma: float,
+    alpha: float,
+    symmetric: bool = False,
+    stall_penalty: float = -1.0,
+    stall_terminates: bool = True,
+    max_no_food_base: int = None,
+    buf=None,
+    seed=None,
+):
     seed = 0 if seed is None else int(seed)
-    env = SnakeEnv(n=n, gamma=gamma, alpha=alpha, seed=seed)
+    env = SnakeEnv(
+        n=n,
+        gamma=gamma,
+        alpha=alpha,
+        seed=seed,
+        stall_penalty=stall_penalty,
+        stall_terminates=stall_terminates,
+        max_no_food_base=max_no_food_base,
+    )
     if symmetric:
         env = SnakeSymmetricAugmentation(env, flip_prob=0.5, seed=seed)
     env = SnakeEpisodeStats(env)
@@ -296,8 +315,12 @@ def main():
     parser.add_argument("--eval-episodes", type=int, default=50)
     parser.add_argument("--eval-deterministic", action="store_true")
     parser.add_argument("--perfect-patience", type=int, default=0, help="0 = disable early stop")
-    parser.add_argument("--symmetric", action="store_true", help="Enable symmetric augmentation (50% horizontal flip)")
+    parser.add_argument("--symmetric", action="store_true", help="Enable symmetric augmentation (50%% horizontal flip)")
     parser.add_argument("--network-scale", type=int, default=1, choices=[1, 2, 4], help="Network width multiplier (1=base, 2=2x, 4=4x)")
+    parser.add_argument("--stall-penalty", type=float, default=-1.0, help="Penalty for stalling (default: -1.0, same as death)")
+    parser.add_argument("--stall-terminates", action="store_true", default=True, help="Stall ends episode (terminated=True, not truncated)")
+    parser.add_argument("--no-stall-terminates", action="store_false", dest="stall_terminates", help="Stall truncates instead of terminates")
+    parser.add_argument("--max-no-food-base", type=int, default=None, help="Override max steps without food (default: dynamic based on length)")
     parser.add_argument("--checkpoint-interval", type=int, default=200)
     parser.add_argument("--exp-name", type=str, default=None, help="Experiment name (default: auto-generated)")
     parser.add_argument("--data-dir", type=str, default="experiments")
@@ -358,7 +381,15 @@ def main():
         physical = 1
     torch.set_num_threads(max(1, physical - (num_workers or 0)))
 
-    env_kwargs = dict(n=args.board_size, gamma=args.gamma, alpha=args.alpha, symmetric=args.symmetric)
+    env_kwargs = dict(
+        n=args.board_size,
+        gamma=args.gamma,
+        alpha=args.alpha,
+        symmetric=args.symmetric,
+        stall_penalty=args.stall_penalty,
+        stall_terminates=args.stall_terminates,
+        max_no_food_base=args.max_no_food_base,
+    )
     vec_kwargs = dict(
         num_envs=args.num_envs,
         seed=args.seed,
@@ -449,15 +480,39 @@ def main():
     if resume_state is not None:
         if "optimizer_state_dict" in resume_state:
             trainer.optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+
         trainer.global_step = resume_steps
         trainer.epoch = resume_epoch
         trainer.last_log_step = resume_steps
         trainer.last_log_time = time.time()
-        try:
-            trainer.scheduler.last_epoch = resume_epoch
-        except Exception:
-            pass
-        print(f"resume_state: steps={resume_steps} epoch={resume_epoch}", file=sys.stderr)
+
+        # Properly restore or recreate scheduler
+        if args.resume_add_steps:
+            # When extending training, recreate scheduler with new T_max
+            # This creates a fresh cosine schedule that continues from where we left off
+            trainer.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                trainer.optimizer,
+                T_max=trainer.total_epochs,
+                last_epoch=resume_epoch - 1,  # -1 because step() will increment
+            )
+            # Force LR update to correct value
+            trainer.scheduler.step()
+        elif "scheduler_state_dict" in resume_state:
+            # Normal resume - restore exact scheduler state
+            trainer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        else:
+            # Fallback: just set last_epoch (may not work correctly)
+            try:
+                trainer.scheduler.last_epoch = resume_epoch
+            except Exception:
+                pass
+
+        lr = trainer.optimizer.param_groups[0]["lr"]
+        print(
+            f"resume_state: steps={resume_steps} epoch={resume_epoch} "
+            f"lr={lr:.2e} T_max={trainer.scheduler.T_max}",
+            file=sys.stderr,
+        )
 
     tracker = None
     try:
