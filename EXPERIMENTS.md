@@ -149,7 +149,7 @@ Both exp012 and exp013 plateau at ~39% (score ~155/397). Investigating why.
 
 **Conclusion:** Stall fix did NOT break the plateau. Same ~39% result as exp012. High eval variance (10 episodes too few).
 
-### exp023 - Alpha Decay (Running)
+### exp023 - Alpha Decay
 **Hypothesis:** Distance shaping (alpha=0.2) hurts late-game. Optimal paths often require moving AWAY from food first (to navigate around body). Constant shaping fights this.
 
 **Changes:**
@@ -159,7 +159,82 @@ Both exp012 and exp013 plateau at ~39% (score ~155/397). Investigating why.
 - At length 300 (75%): α=0.05 (minimal)
 
 **Config:** board=20, network-scale=2, symmetric, 100M steps
-**Status:** Running
+**Result:** 0% win rate, eval score **~139/397 (35%)** - WORSE than baseline
+
+**Conclusion:** Alpha decay made it worse (35% vs 39%). Reverted.
+
+### exp024/exp028 - Tail Channel
+**Hypothesis:** Adding 6th observation channel showing tail position helps agent see where space opens up.
+
+**Result:** Hurt performance on both 20x20 (149 vs 154) and 10x10 (68% vs 100% win rate at 20M steps).
+
+**Conclusion:** Extra channel adds noise without useful signal. Reverted.
+
+---
+
+## Phase 6: Architecture Exploration
+
+### exp030 - CNN on 10x10
+**Hypothesis:** CNN's spatial inductive bias (translation invariance, local patterns) might learn faster than MLP.
+
+**Config:** board=10, CNN (32→64→64 channels), 50M steps
+**Result:** **100% win rate at 6M steps** (vs MLP at 40M) - 6x faster!
+
+| Steps | CNN | MLP |
+|-------|-----|-----|
+| 6M | 100% win | 0% win |
+| 20M | 80-100% | first win |
+| 40M | oscillating | 100% |
+
+**Conclusion:** CNN learns dramatically faster on 10x10. But oscillates between 70-100% instead of stable 100%.
+
+### exp031 - CNN on 20x20 (2x scale)
+**Config:** board=20, CNN 2x (64→128→128), 55M steps
+**Result:** Peaked at 75.5 score @ 30M, then oscillated 50-75. Never approached MLP's 154.
+
+**Conclusion:** CNN's advantage doesn't scale to 20x20. Lower ceiling than MLP.
+
+### exp033-044 - Directional Architectures
+Tested architectures that align observation structure with action space (3 directions → 3 actions).
+
+| Exp | Architecture | Params | Peak Score | Notes |
+|-----|--------------|--------|------------|-------|
+| exp033 | Ray-casting | 5K | 0.0 | Dead - too simple, lost spatial context |
+| exp034 | 3-branch CNN | 62K | 6.6 @ 7M | Slow learner |
+| exp035 | Attention LR 3e-4 | 61K | 38.9 @ 7M | Collapsed at 8M |
+| exp039 | Attention LR 1e-4 | 61K | 0.0 | Too slow to learn |
+| exp040 | Attention LR 2e-4 | 61K | ~35 | Unstable oscillation |
+| exp043 | Attention strided | 61K | 35.8 @ 14M | Oscillated 10-35 |
+
+**Conclusion:** Directional architectures all failed. Either dead, slow, or unstable. MLP remains best.
+
+### exp045/exp046 - MLP Scale Comparison
+**Hypothesis:** Maybe MLP just needs more capacity (4x) or less (1x)?
+
+| Scale | Params | Peak Score | Notes |
+|-------|--------|------------|-------|
+| 1x | 3.2M | 112.6 @ 40M | Fastest learner per step, then collapsed |
+| 2x | 7.9M | 154.5 @ 90M | Best overall (baseline) |
+| 4x | 21.5M | 83.2 @ 60M | Slower, oscillating 50-83 |
+
+**Conclusion:** 2x is sweet spot. 1x learns fast but collapses. 4x might be overfitting.
+
+---
+
+## Key Insight: Policy Oscillation
+
+**All architectures show the same pattern:**
+1. Score improves → finds good strategy
+2. Keeps training → overwrites good weights
+3. Score crashes → "forgets" what worked
+4. Sometimes recovers, sometimes not
+
+This is **policy oscillation** / catastrophic forgetting - a known PPO problem:
+- No replay buffer (unlike DQN) - only learns from recent experience
+- Once policy changes, old successful trajectories are gone
+- Can "forget" good strategies mid-training
+
+**The 39% plateau is NOT an architecture problem - it's training dynamics.**
 
 ---
 
@@ -169,11 +244,17 @@ Both exp012 and exp013 plateau at ~39% (score ~155/397). Investigating why.
 2. **Symmetric augmentation helps** - Horizontal flip provides effective data augmentation
 3. **Deterministic eval >> stochastic training** - 67% eval win rate vs 32% training win rate at same checkpoint
 4. **HIGH VARIANCE on 10x10** - Same config can give 0% or 100% win rate. Try multiple seeds.
-5. **20x20 plateaus at 39%** - exp012, exp022 both hit score ~155/397 wall at 100M steps
+5. **20x20 plateaus at 39%** - All architectures (MLP, CNN, attention) hit ~155/397 wall
 6. **Horizon=512 didn't help** - exp013 showed no improvement over horizon=128
-7. **GRPO doesn't work for Snake** - 60-400x worse sample efficiency than PPO. Value function is essential for dense-reward MDPs
-8. **Stall handling didn't help** - exp022 showed same plateau despite proper termination and -1.0 penalty
-9. **10-episode evals too noisy** - exp022 showed score jumping from 133→69→154 between evals
+7. **GRPO doesn't work for Snake** - 60-400x worse sample efficiency than PPO
+8. **Stall handling didn't help** - exp022 showed same plateau
+9. **Alpha decay made it worse** - exp023: 35% vs baseline 39%
+10. **Tail channel hurt performance** - exp024/028: Added noise without useful signal
+11. **CNN learns 6x faster on 10x10** - exp030: 100% win at 6M vs MLP at 40M
+12. **CNN doesn't scale to 20x20** - exp031: Peaked at 75 vs MLP's 154
+13. **Directional architectures all failed** - Ray-casting, 3-branch, attention all worse than MLP
+14. **Policy oscillation is the core issue** - All models show same collapse pattern, not architecture-specific
+15. **MLP 2x is optimal scale** - 1x collapses, 4x overfits, 2x best balance
 
 ## Network Architectures
 
