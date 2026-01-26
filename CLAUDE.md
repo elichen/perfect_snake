@@ -13,11 +13,11 @@
 python -m venv .venv && source .venv/bin/activate
 pip install torch gymnasium numpy pufferlib psutil
 
-# Current experiment (alpha decay - exp023)
-python train.py --board-size 20 --timesteps 100000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --network-scale 2 --device mps --eval-every-steps 5000000 --eval-deterministic --eval-episodes 10 --exp-name exp023_alpha_decay
+# 10x10 experiment (for quick arch iteration)
+python train.py --board-size 10 --timesteps 50000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --device mps --eval-every-steps 1000000 --eval-deterministic --eval-episodes 10 --exp-name exp_name_here
 
-# 10x10 baseline (for testing changes)
-python train.py --board-size 10 --timesteps 50000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --device mps --eval-every-steps 5000000 --eval-deterministic --eval-episodes 10
+# 20x20 experiment (full scale)
+python train.py --board-size 20 --timesteps 100000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --network-scale 2 --device mps --eval-every-steps 1000000 --eval-deterministic --eval-episodes 10 --exp-name exp_name_here
 
 # List tracked experiments
 python experiments.py list
@@ -46,7 +46,8 @@ perfect_snake/
     └── {name}_{id}/      # Run directories
         ├── run.json      # Config + metadata
         ├── metrics.jsonl # Train/eval events
-        └── summary.json  # Best/last eval results
+        ├── summary.json  # Best/last eval results
+        └── code/         # Archived source (snake_env.py, train.py)
 ```
 
 ## Where to Find Experiment Learnings
@@ -80,7 +81,7 @@ perfect_snake/
 - **Actions**: 3 discrete (turn left, straight, turn right)
 - **Rewards**:
   - +1 food, -1 death, -1 stall (configurable)
-  - Distance shaping with alpha decay: `alpha * (1 - progress)` where progress = length/board_area
+  - Distance shaping: `-alpha * normalized_distance_to_food`
 
 ## Key Parameters
 
@@ -99,18 +100,19 @@ perfect_snake/
 | `--stall-penalty` | -1.0 | Penalty for stalling |
 | `--stall-terminates` | true | Stall ends episode (not truncate) |
 | `--device` | cpu | `cpu`, `cuda`, or `mps` |
-| `--eval-every-steps` | 0 | Eval frequency (0=disable) |
-| `--eval-episodes` | 50 | Episodes per eval |
+| `--eval-every-steps` | 1000000 | Eval every 1M steps (for quick feedback) |
+| `--eval-episodes` | 10 | Episodes per eval (fast but sufficient) |
 
 ## Current 20x20 Plateau
 
 Best result: **39% (score 155/397)** - both exp012 and exp022 hit this wall.
 
-**Hypotheses being tested:**
+**Hypotheses tested:**
 1. ~~Stall handling~~ (exp022 - didn't help)
-2. **Alpha decay** (exp023 - running) - reduce distance shaping late-game
-3. Tail channel observation - help agent see where space opens up
-4. Larger network (4x) or different gamma
+2. ~~Alpha decay~~ (exp023 - made it worse: 35% vs 39%)
+3. ~~Tail channel~~ (exp024/exp028 - hurt performance on both 20x20 and 10x10)
+4. **Minimal 2-channel obs** (exp029 - testing: body + food only)
+5. Larger network (4x) or different gamma - not yet tested
 
 ## Results Summary
 

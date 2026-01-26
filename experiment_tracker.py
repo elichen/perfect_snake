@@ -117,6 +117,15 @@ class ExperimentTracker:
     def _init_paths(self) -> None:
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.run_dir, exist_ok=True)
+
+        # Archive source files for reproducibility
+        code_dir = os.path.join(self.run_dir, "code")
+        os.makedirs(code_dir, exist_ok=True)
+        for src_file in ["snake_env.py", "train.py"]:
+            src_path = os.path.join(os.path.dirname(__file__), src_file)
+            if os.path.exists(src_path):
+                shutil.copy2(src_path, os.path.join(code_dir, src_file))
+
         run_record = {
             "schema_version": 1,
             "exp_name": self.exp_name,

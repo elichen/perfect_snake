@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import multiprocessing
+import sys
+
+# Use 'spawn' to avoid PyTorch/MPS crashes on worker exit (macOS)
+# Must be set before any multiprocessing happens
+try:
+    if sys.platform == 'darwin':
+        multiprocessing.set_start_method('spawn')
+except RuntimeError:
+    pass  # Already set
+
 import argparse
 import os
 import shlex
-import sys
 import time
 
 import gymnasium as gym
@@ -198,6 +208,86 @@ class SnakePolicy(nn.Module):
         return self.forward_eval(observations, state)
 
 
+class SnakeCNNPolicy(nn.Module):
+    """CNN policy for Snake - better at spatial patterns."""
+
+    def __init__(self, env, scale: int = 1):
+        super().__init__()
+
+        obs_space = getattr(env, "single_observation_space", env.observation_space)
+        act_space = getattr(env, "single_action_space", env.action_space)
+        obs_shape = obs_space.shape  # (C, H, W)
+        n_channels = obs_shape[0]
+        n_actions = act_space.n
+
+        # Scale conv channels: 1x=small, 2x=medium, 4x=large
+        if scale >= 4:
+            c = [128, 256, 256]
+            hidden = 1024
+        elif scale >= 2:
+            c = [64, 128, 128]
+            hidden = 512
+        else:
+            c = [32, 64, 64]
+            hidden = 256
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(n_channels, c[0], kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(c[0], c[1], kernel_size=3, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(c[1], c[2], kernel_size=3, stride=2),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        # Calculate conv output size
+        with torch.no_grad():
+            dummy = torch.zeros(1, *obs_shape)
+            conv_out = self.conv(dummy).shape[1]
+
+        self.features = nn.Sequential(
+            nn.Linear(conv_out, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+        )
+
+        self.policy_head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, n_actions),
+        )
+
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv2d):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                nn.init.zeros_(module.bias)
+
+    def forward_eval(self, observations, state=None):
+        x = self.conv(observations)
+        features = self.features(x)
+        logits = self.policy_head(features)
+        values = self.value_head(features)
+        return logits, values
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
+
 def _auto_num_workers(num_envs: int) -> int:
     try:
         physical = psutil.cpu_count(logical=False) or 1
@@ -317,6 +407,7 @@ def main():
     parser.add_argument("--perfect-patience", type=int, default=0, help="0 = disable early stop")
     parser.add_argument("--symmetric", action="store_true", help="Enable symmetric augmentation (50%% horizontal flip)")
     parser.add_argument("--network-scale", type=int, default=1, choices=[1, 2, 4], help="Network width multiplier (1=base, 2=2x, 4=4x)")
+    parser.add_argument("--cnn", action="store_true", help="Use CNN policy instead of MLP")
     parser.add_argument("--stall-penalty", type=float, default=-1.0, help="Penalty for stalling (default: -1.0, same as death)")
     parser.add_argument("--stall-terminates", action="store_true", default=True, help="Stall ends episode (terminated=True, not truncated)")
     parser.add_argument("--no-stall-terminates", action="store_false", dest="stall_terminates", help="Stall truncates instead of terminates")
@@ -400,7 +491,11 @@ def main():
         vec_kwargs["num_workers"] = num_workers
     vecenv = pufferlib.vector.make(make_snake_env, **vec_kwargs)
 
-    policy = SnakePolicy(vecenv.driver_env, scale=args.network_scale).to(args.device)
+    if args.cnn:
+        policy = SnakeCNNPolicy(vecenv.driver_env, scale=args.network_scale).to(args.device)
+    else:
+        policy = SnakePolicy(vecenv.driver_env, scale=args.network_scale).to(args.device)
+
     if args.resume:
         state = torch.load(args.resume, map_location="cpu")
         policy.load_state_dict(state, strict=True)

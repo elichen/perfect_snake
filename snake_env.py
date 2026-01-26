@@ -115,15 +115,10 @@ class SnakeEnv(gym.Env):
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     def _compute_phi(self) -> float:
-        # Decay alpha as snake grows - late game needs less shaping
-        # because optimal paths often require moving away from food first
-        progress = self.snake_length / (self.n * self.n)
-        alpha_eff = self.alpha * (1 - progress)
-
         d = self._manhattan_distance(self.snake_head, self.food_pos)
         max_d = 2 * (self.n - 1)
         d_norm = d / max_d if max_d > 0 else 0.0
-        return -alpha_eff * d_norm
+        return -self.alpha * d_norm
 
     def _place_food(self) -> None:
         snake_set = set(self.snake)
