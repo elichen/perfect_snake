@@ -105,20 +105,26 @@ perfect_snake/
 
 ## Current 20x20 Plateau
 
-Best result: **39% (score 155/397)** - both exp012 and exp022 hit this wall.
+Best result: **41% (score 162/397)** - exp056 (ultra-conservative finetune).
 
 **Hypotheses tested:**
 1. ~~Stall handling~~ (exp022 - didn't help)
 2. ~~Alpha decay~~ (exp023 - made it worse: 35% vs 39%)
-3. ~~Tail channel~~ (exp024/exp028 - hurt performance on both 20x20 and 10x10)
-4. **Minimal 2-channel obs** (exp029 - testing: body + food only)
-5. Larger network (4x) or different gamma - not yet tested
+3. ~~Tail channel~~ (exp024/028 - hurt performance on both 20x20 and 10x10)
+4. ~~Minimal 2-channel obs~~ (exp029 - worse: 57.5 on 10x10)
+5. ~~Larger network 4x~~ (exp045 - worse: peak 83 vs 2x's 155)
+6. ~~Smaller network 1x~~ (exp046 - peak 113 but collapsed)
+7. ~~LR/entropy decay~~ (exp047-049 - unreliable, high variance)
+8. ~~CNN with coordinates~~ (exp051-054 - all <92 on 20x20)
+9. **Finetuning with low LR** (exp050/055/056 - most stable, new best peak 162)
+
+**Core issue:** Policy oscillation / catastrophic forgetting — not architecture.
 
 ## Results Summary
 
 | Board | Best Result | Steps | Experiment |
 |-------|-------------|-------|------------|
 | 10x10 | 100% win | 26M | exp007 |
-| 20x20 | 39% (155/397) | 100M | exp012, exp022 |
+| 20x20 | 41% (162/397) | finetune | exp056 |
 
 **Note:** High variance. Same config can give 0% or 100%. Try multiple seeds.

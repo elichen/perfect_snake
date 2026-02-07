@@ -221,6 +221,64 @@ Tested architectures that align observation structure with action space (3 direc
 
 ---
 
+## Phase 7: Training Stability & Finetuning
+
+### exp047 - LR + Entropy Decay (seed 42)
+**Hypothesis:** Decaying LR (min_lr_ratio=0.1) and entropy (0.02→0.002) reduces policy oscillation.
+
+**Config:** board=20, network-scale=2, symmetric, 100M steps
+**Result:** 0% win rate, eval score **127.4/397 (32%)** peak, collapsed to 56.7
+
+**Conclusion:** Peak was decent but severe late collapse. LR decay destabilizes.
+
+### exp048 - LR + Entropy Decay (seed 1)
+**Config:** board=20, network-scale=2, min_lr_ratio=0.05, entropy 0.02→0.001, 100M steps
+**Result:** 0% win rate, eval score **49.3/397 (12%)** peak
+
+**Conclusion:** Much worse with different seed. Approach unreliable.
+
+### exp049 - Entropy Annealing Only (seed 7)
+**Hypothesis:** Maybe just entropy decay (no LR decay) helps.
+
+**Config:** board=20, network-scale=2, no_anneal_lr=true, entropy 0.02→0.001, 100M steps
+**Result:** 0% win rate, eval score **103.7/397 (26%)** peak, last 58.1
+
+**Conclusion:** Better than exp048 but still oscillates. Entropy-only insufficient.
+
+### exp050 - Finetune from Checkpoint (seed 11)
+**Hypothesis:** Start from exp016 checkpoint, finetune with low LR (5e-5), reduced epochs.
+
+**Config:** board=20, network-scale=2, LR=5e-5, 60M steps
+**Result:** 0% win rate, eval score **116.6/397 (29%)** peak, last 108.7
+
+**Conclusion:** Most stable run — small variance. Finetuning with low LR works.
+
+### exp051-054 - CNN with Coordinate Channels
+Various CNN architectures with centered head, coordinate channels, different strides/pooling.
+
+| Exp | Architecture | Peak Score | Notes |
+|-----|-------------|------------|-------|
+| exp051 | CNN no-stride | 92.0 | Underperforms MLP |
+| exp052 | CNN pool=11 | failed | Broke immediately |
+| exp053 | CNN stride=2, pool=3 | 80.7 | Stable but low ceiling |
+| exp054 | CNN stride=2, LR=1e-4 | 75.0 | Lower LR hurt |
+
+**Conclusion:** CNN variants all underperform MLP on 20x20. Not worth pursuing.
+
+### exp055 - MLP Finetune + Lower Entropy (seed 11)
+**Config:** Finetune from checkpoint, lower entropy (0.01→0.001), 16384 minibatch, 2 epochs
+**Result:** 0% win rate, eval score **136.6/397 (34%)** peak, last 90.9
+
+**Conclusion:** Better peak than exp050 but more variance.
+
+### exp056 - MLP Finetune Ultra-Conservative (seed 11)
+**Config:** Finetune from checkpoint, LR=2.5e-5, constant entropy=0.003, 1 epoch
+**Result:** 0% win rate, eval score **162.2/397 (41%)** peak, last 124.2
+
+**Conclusion:** **NEW BEST PEAK: 162.2** — ultra-conservative finetuning slightly beats baseline 154.5. Still high variance.
+
+---
+
 ## Key Insight: Policy Oscillation
 
 **All architectures show the same pattern:**
@@ -255,6 +313,10 @@ This is **policy oscillation** / catastrophic forgetting - a known PPO problem:
 13. **Directional architectures all failed** - Ray-casting, 3-branch, attention all worse than MLP
 14. **Policy oscillation is the core issue** - All models show same collapse pattern, not architecture-specific
 15. **MLP 2x is optimal scale** - 1x collapses, 4x overfits, 2x best balance
+16. **LR/entropy decay unreliable** - exp047-049: high variance, severe collapses
+17. **Finetuning with low LR is most stable** - exp050: small variance, sustained ~110+
+18. **Ultra-conservative finetune = new best** - exp056: peak 162.2 with LR=2.5e-5, 1 epoch
+19. **CNN with coordinates still loses to MLP** - exp051-054: all <92 on 20x20
 
 ## Network Architectures
 
@@ -282,8 +344,12 @@ python eval.py experiments/checkpoint.pt --board-size 20 --episodes 100 --determ
 
 ## Next Experiments to Try
 
-If alpha decay doesn't help:
-1. **Tail channel** - Add 6th observation channel showing tail position
-2. **4x network** - More capacity (14.5M params vs 4.4M)
-3. **Gamma 0.995** - Longer horizon for credit assignment
-4. **More eval episodes** - 30+ to reduce variance
+Core problem is **policy oscillation** — agent finds good strategies but overwrites them.
+
+1. **Checkpoint ensembling / selection** - Save frequently, pick best checkpoint
+2. **EWC / weight regularization** - Penalize moving away from good weights
+3. **Population-based training** - Multiple seeds, keep best
+4. **Curriculum learning** - Start small board, gradually increase
+5. **MCTS + policy network** - Search-augmented play at eval time
+6. **Gamma 0.995** - Longer credit assignment horizon
+7. **More eval episodes** - 50+ to reduce eval variance
