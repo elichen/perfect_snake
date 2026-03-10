@@ -279,20 +279,153 @@ Various CNN architectures with centered head, coordinate channels, different str
 
 ---
 
-## Key Insight: Policy Oscillation
+## Phase 8: Flood-Fill Observation (Breakthrough)
 
-**All architectures show the same pattern:**
-1. Score improves → finds good strategy
-2. Keeps training → overwrites good weights
-3. Score crashes → "forgets" what worked
-4. Sometimes recovers, sometimes not
+Adding a 6th observation channel with flood-fill reachability broke the 40% ceiling. The channel marks which empty cells are reachable from the snake's head via connected-component analysis (scipy.ndimage.label).
 
-This is **policy oscillation** / catastrophic forgetting - a known PPO problem:
-- No replay buffer (unlike DQN) - only learns from recent experience
-- Once policy changes, old successful trajectories are gone
-- Can "forget" good strategies mid-training
+### exp057/058/059 - Gamma/Alpha Experiments (No Flood-Fill)
+Tested gamma=0.999 and alpha=0 without flood-fill.
 
-**The 39% plateau is NOT an architecture problem - it's training dynamics.**
+| Exp | Config | Peak Score | Notes |
+|-----|--------|------------|-------|
+| exp057 | 10x10, alpha=0, gamma=0.999 | 79.2 | Agent can't find food without shaping |
+| exp058 | 20x20, alpha=0, gamma=0.999 | 43.1 | Same — alpha=0 kills food-seeking |
+| exp059 | 20x20, alpha=0.05, gamma=0.995 | 36.3 | Low alpha insufficient |
+| exp060 | 20x20, gamma=0.995 | 139.9 | Slight improvement, high variance |
+
+**Conclusion:** Gamma alone doesn't break plateau. Alpha=0 is fatal on 20x20.
+
+### exp061 - Flood-Fill Observation Channel
+**Hypothesis:** Agent needs to see which cells are reachable to avoid self-trapping.
+
+**Changes:** Added 6th observation channel — flood-fill reachability from head using scipy connected components. ~3.6x env slowdown, ~10% training SPS impact.
+
+**Config:** board=20, network-scale=2, 6-channel obs, gamma=0.995, 200M steps
+**Result:** **216.4/397 (54.5%)** — up from 162.2 (41%)
+
+**Bug found:** evaluate_policy() wasn't passing flood_fill_obs to eval env, causing MPS to hang on shape mismatch. Fixed by passing all env kwargs through.
+
+**Resumed run:** Reached **249.7/397 (62.9%)** at extended training.
+
+**Conclusion:** Flood-fill observation is a major breakthrough — biggest single improvement.
+
+### exp063/064 - Weight-Tied Iterative CNN
+**Hypothesis:** Iterative CNN with shared weights might learn flood-fill-like reasoning.
+
+| Exp | Config | Peak Score | Notes |
+|-----|--------|------------|-------|
+| exp063 | Iterative CNN 1x, 12 iterations | ~60 | 3-4x worse than MLP |
+| exp064 | Iterative CNN 2x, 12 iterations | ~80 | Still far below MLP |
+
+**Conclusion:** Iterative CNN failed. MLP remains best architecture.
+
+### exp065 - MLP + Aux Flood-Fill Decoder
+**Hypothesis:** Adding auxiliary loss to predict flood-fill map improves feature learning.
+
+**Changes:** Added flood-fill decoder head off shared features, trained with separate BCE loss after PPO step.
+
+**Config:** board=20, network-scale=2, flood-fill obs, aux flood-fill decoder, 100M steps
+**Result:** **239.8/397 (60.4%)**
+
+**Conclusion:** Aux decoder helps slightly vs flood-fill obs alone.
+
+### exp066 - MLP + Aux, 200M Steps with Cosine LR
+**Config:** Same as exp065, 200M steps, cosine LR decay (3e-4 → 3e-5)
+**Result:** **255.2/397 (64.3%)** at 190M steps
+
+### exp067 - 1B Steps, Full Cosine
+**Config:** 1B steps, cosine LR over full 1B
+**Result:** Peaked at **172/397** — LR too high for too long, never recovered.
+
+**Conclusion:** Cosine over 200M then constant min_lr is better than cosine over full run.
+
+### exp068 - 1B Steps, Fast Cosine Decay
+**Config:** 1B steps, cosine over 200M then constant min_lr=3e-5
+**Result:** **264.2/397 (66.5%)** at 301M steps
+
+---
+
+## Phase 9: Extended Credit Assignment (Breakthrough)
+
+### exp069 - Curriculum Spawning
+**Hypothesis:** Training from late-game positions helps agent learn endgame patterns.
+
+**Changes:** 30% of episode resets start at 50-85% fill using zigzag Hamiltonian path placement.
+
+**Config:** board=20, network-scale=2, flood-fill, aux, curriculum_prob=0.3, 200M steps
+**Result:** **258.4/397 (65.1%)** — same as without curriculum
+
+**Conclusion:** Curriculum alone doesn't help much.
+
+### exp070 - Curriculum + gamma=0.999 + horizon=256
+**Hypothesis:** Agent needs longer credit assignment horizon. gamma=0.999 failed alone (exp057) but might work with curriculum + horizon=256.
+
+**Changes:** gamma=0.999 (from 0.995), horizon=256 (from 128), gae_lambda=0.9 (from 0.95), vf_clip_coef=1.0
+
+**Config:** board=20, network-scale=2, flood-fill, aux, curriculum, 500M steps
+**Result:** **313.2/397 (78.9%)** at 271M steps — **massive new best!**
+
+**Resumed run:** Reached **326.5/397 (82.2%)**
+
+**Error analysis (50 eps, epoch 4200):**
+- mean=295.8, median=322, max=336 (84.8%)
+- 100% self-collision deaths (0% wall deaths)
+- 29/50 episodes reach 80%+ fill
+- Reachability at death: 16% (down from 50% in exp068) — agent now dies genuinely trapped
+- 3/50 early blunders (<15% fill)
+
+**Key insight:** gamma=0.999 previously failed alone, but works with curriculum + higher horizon. Credit assignment was the bottleneck — agent needs to propagate rewards ~700 steps to learn from decisions that create traps.
+
+---
+
+## Phase 10: Head-Centered Observation
+
+### exp072 - Head-Centered + Bug Fixes
+**Hypothesis:** Head-centered observation (39x39 grid centered on head) provides translation invariance — agent sees the same local pattern regardless of board position.
+
+**Changes:**
+- Head-centered observation: 5 x 39 x 39 (vs 5 x 22 x 22 board-centered)
+- Head always at grid center (19, 19)
+- Walls computed dynamically based on head position
+- **Bug fix:** flood-fill now marks ALL reachable connected components (was only marking first neighbor's component due to premature `break`)
+- **Bug fix:** aux flood-fill decoder target corrected for head-centered mode
+
+**Config:** board=20, network-scale=2, head-centered, flood-fill, aux, curriculum, gamma=0.999, horizon=256, 500M steps
+
+**Progression:**
+| Steps | Eval Score | % |
+|-------|-----------|---|
+| 10M | 42.0 | 10.6% |
+| 40M | 157.6 | 39.7% |
+| 100M | 236.8 | 59.6% |
+| 130M | 281.6 | 70.9% |
+| 170M | 317.6 | 80.0% |
+| 240M | 322.1 | 81.1% |
+| 260M | 371.8 | 93.6% |
+
+**Best eval: 371.8/397 (93.6%)**
+
+**Error analysis (50 eps, epoch 6200 ~411M steps):**
+- mean=278.7, median=360, max=**394 (99.2% fill — 3 food from perfect!)**
+- 5 episodes scored 394/397
+- Bimodal failure: early blunders (<20% fill, ~18%) or brilliant play to 90%+
+- 100% self-collision deaths
+- Aux loss dropped from ~0.2 (pre-fix) to ~0.077 (post-fix)
+
+---
+
+## Results Summary
+
+| Board | Best Result | Experiment | Key Changes |
+|-------|-------------|------------|-------------|
+| 10x10 | **100% win rate** | exp007 | Egocentric + symmetric, 26M steps |
+| 20x20 | 162.2/397 (41%) | exp056 | Ultra-conservative finetune |
+| 20x20 | 216.4/397 (54%) | exp061 | + Flood-fill observation |
+| 20x20 | 255.2/397 (64%) | exp066 | + Aux flood-fill decoder, cosine LR |
+| 20x20 | 264.2/397 (67%) | exp068 | + 1B steps, fast cosine decay |
+| 20x20 | 313.2/397 (79%) | exp070 | + gamma=0.999, horizon=256, curriculum |
+| 20x20 | **371.8/397 (94%)** | exp072 | + Head-centered obs, flood-fill bugfix |
+| 20x20 | **394/397 (99.2%)** | exp072 | Best single episode (3 food from perfect) |
 
 ---
 
@@ -300,28 +433,25 @@ This is **policy oscillation** / catastrophic forgetting - a known PPO problem:
 
 1. **Egocentric observation is critical** - Rotating grid so snake faces "up" reduces 4 direction cases to 1
 2. **Symmetric augmentation helps** - Horizontal flip provides effective data augmentation
-3. **Deterministic eval >> stochastic training** - 67% eval win rate vs 32% training win rate at same checkpoint
-4. **HIGH VARIANCE on 10x10** - Same config can give 0% or 100% win rate. Try multiple seeds.
-5. **20x20 plateaus at 39%** - All architectures (MLP, CNN, attention) hit ~155/397 wall
-6. **Horizon=512 didn't help** - exp013 showed no improvement over horizon=128
-7. **GRPO doesn't work for Snake** - 60-400x worse sample efficiency than PPO
-8. **Stall handling didn't help** - exp022 showed same plateau
-9. **Alpha decay made it worse** - exp023: 35% vs baseline 39%
-10. **Tail channel hurt performance** - exp024/028: Added noise without useful signal
-11. **CNN learns 6x faster on 10x10** - exp030: 100% win at 6M vs MLP at 40M
-12. **CNN doesn't scale to 20x20** - exp031: Peaked at 75 vs MLP's 154
+3. **MLP 2x is optimal scale** - 1x collapses, 4x overfits, 2x is the sweet spot (4.4M params)
+4. **Flood-fill observation channel is the biggest single improvement** - Broke the 40% ceiling to 54%
+5. **gamma=0.999 + horizon=256 is the second biggest improvement** - 66% → 79%, but only works with curriculum spawning
+6. **Head-centered observation + flood-fill bugfix** - 79% → 94% eval, 99.2% best single episode
+7. **Curriculum spawning enables gamma=0.999** - Spawning at 50-85% fill gives agent late-game experience; gamma=0.999 alone causes instability
+8. **Aux flood-fill decoder helps slightly** - Separate BCE loss on flood-fill prediction
+9. **Cosine LR decay over 200M then constant min_lr** - Better than cosine over full run or no decay
+10. **Distance shaping alpha=0.2 is essential** - Agent can't find food on 20x20 without it
+11. **GRPO is 60-400x worse than PPO** - Designed for sparse rewards, fails with dense per-step rewards
+12. **CNN doesn't scale to 20x20** - Learns faster on 10x10 but lower ceiling on 20x20
 13. **Directional architectures all failed** - Ray-casting, 3-branch, attention all worse than MLP
-14. **Policy oscillation is the core issue** - All models show same collapse pattern, not architecture-specific
-15. **MLP 2x is optimal scale** - 1x collapses, 4x overfits, 2x best balance
-16. **LR/entropy decay unreliable** - exp047-049: high variance, severe collapses
-17. **Finetuning with low LR is most stable** - exp050: small variance, sustained ~110+
-18. **Ultra-conservative finetune = new best** - exp056: peak 162.2 with LR=2.5e-5, 1 epoch
-19. **CNN with coordinates still loses to MLP** - exp051-054: all <92 on 20x20
+14. **Weight-tied iterative CNN failed** - 3-4x worse than MLP
+15. **Alpha decay, tail channel both hurt** - Removed features
+16. **Policy oscillation is real but manageable** - Long training + cosine LR + curriculum overcomes it
 
 ## Network Architectures
 
-| Scale | Backbone | Policy Head | Value Head | Params (10x10) |
-|-------|----------|-------------|------------|----------------|
+| Scale | Backbone | Policy Head | Value Head | Params |
+|-------|----------|-------------|------------|--------|
 | 1x | 1024→512→256→128 | 128→64→3 | 128→128→64→1 | 1.5M |
 | 2x | 2048→1024→512→256 | 256→128→3 | 256→256→128→1 | 4.4M |
 | 4x | 4096→2048→1024→512 | 512→256→3 | 512→512→256→1 | 14.5M |
@@ -329,27 +459,33 @@ This is **policy oscillation** / catastrophic forgetting - a known PPO problem:
 ## Commands
 
 ```bash
-# Current experiment (alpha decay)
-python train.py --board-size 20 --timesteps 100000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --network-scale 2 --device mps --eval-every-steps 5000000 --eval-deterministic --eval-episodes 10 --exp-name exp023_alpha_decay
-
-# 10x10 baseline (for testing changes)
-python train.py --board-size 10 --timesteps 50000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --device mps --eval-every-steps 5000000 --eval-deterministic --eval-episodes 10
-
-# 20x20 baseline (before alpha decay)
-python train.py --board-size 20 --timesteps 100000000 --num-envs 256 --horizon 128 --minibatch-size 8192 --symmetric --network-scale 2 --device mps --eval-every-steps 5000000 --eval-deterministic --eval-episodes 10
+# Current best config (exp072)
+caffeinate -i python -u train.py --board-size 20 --timesteps 500000000 --num-envs 256 --horizon 256 --minibatch-size 8192 --symmetric --network-scale 2 --device mps --eval-every-steps 5000000 --eval-deterministic --eval-episodes 10 --flood-fill --aux-flood-fill --gamma 0.999 --gae-lambda 0.9 --vf-clip-coef 1.0 --curriculum-prob 0.3 --head-centered --cosine-lr-steps 200000000 --min-lr 3e-5 --exp-name exp072_head_centered
 
 # Evaluate checkpoint
-python eval.py experiments/checkpoint.pt --board-size 20 --episodes 100 --deterministic --device mps
+python eval.py experiments/checkpoint.pt --board-size 20 --episodes 100 --deterministic --device mps --flood-fill --aux-flood-fill --network-scale 2 --head-centered
+
+# Error analysis
+python error_analysis.py experiments/checkpoint.pt --board-size 20 --episodes 50 --device mps --network-scale 2 --head-centered
+
+# Watch agent play
+python play.py experiments/checkpoint.pt --board-size 20 --device mps --network-scale 2 --flood-fill --aux-flood-fill --head-centered --delay 0.05
+
+# Export for web
+python export_web.py experiments/checkpoint.pt --board-size 20 --network-scale 2 --head-centered --output weights.json
 ```
 
-## Next Experiments to Try
+## Remaining Failure Modes
 
-Core problem is **policy oscillation** — agent finds good strategies but overwrites them.
+At 94% eval (exp072), deaths are:
+- **Early blunders (~18%):** Random-looking deaths at <20% fill, likely policy noise
+- **Self-trapping at 80-90% fill:** Agent boxes itself into corners with no escape
+- **At death:** 52% are true traps (<=3 reachable cells), 48% have room but make bad local moves
+- **Negative correlation** between score and reachability at death: good games die trapped, bad games die with room still available
 
-1. **Checkpoint ensembling / selection** - Save frequently, pick best checkpoint
-2. **EWC / weight regularization** - Penalize moving away from good weights
-3. **Population-based training** - Multiple seeds, keep best
-4. **Curriculum learning** - Start small board, gradually increase
-5. **MCTS + policy network** - Search-augmented play at eval time
-6. **Gamma 0.995** - Longer credit assignment horizon
-7. **More eval episodes** - 50+ to reduce eval variance
+## Next Steps
+
+1. **Reach perfect play (397/397)** - Agent already scores 394 in best episodes
+2. **Reduce early blunders** - 18% of episodes fail before 20% fill
+3. **Better endgame planning** - Search-augmented play (MCTS) at 80%+ fill
+4. **Longer training** - exp072 still improving at 500M steps
