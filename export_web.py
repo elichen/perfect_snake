@@ -10,10 +10,15 @@ import torch.nn as nn
 
 
 class SnakePolicy(nn.Module):
-    def __init__(self, board_size: int, scale: int = 1):
+    def __init__(self, board_size: int, scale: int = 1, head_centered: bool = False):
         super().__init__()
         n_channels = 5
-        obs_shape = (n_channels, board_size + 2, board_size + 2)
+        if head_centered:
+            obs_n = 2 * (board_size - 1) + 1  # 39 for board_size=20
+        else:
+            obs_n = board_size + 2
+        self.obs_n = obs_n
+        obs_shape = (n_channels, obs_n, obs_n)
         n_input = int(np.prod(obs_shape))
         n_actions = 3
 
@@ -45,28 +50,32 @@ class SnakePolicy(nn.Module):
         return self.policy_head(features), self.value_head(features)
 
 
-def export_compact(checkpoint_path: str, output_path: str, board_size: int, network_scale: int):
-    policy = SnakePolicy(board_size, scale=network_scale)
+def export_compact(checkpoint_path: str, output_path: str, board_size: int,
+                    network_scale: int, head_centered: bool = False):
+    policy = SnakePolicy(board_size, scale=network_scale, head_centered=head_centered)
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    policy.load_state_dict(state_dict, strict=True)
-    
-    # Convert to float16 and flatten for compact storage
+    policy.load_state_dict(state_dict, strict=False)
+
+    # Convert to float32 and flatten for compact storage
+    # Only export features + policy_head (skip value_head, flood_decoder, etc.)
     weights = {}
     for name, param in policy.named_parameters():
-        # Round to 4 decimal places and store as flat list
+        if not (name.startswith("features.") or name.startswith("policy_head.")):
+            continue
         arr = param.detach().numpy().astype(np.float32)
         weights[name] = {
             "shape": list(arr.shape),
             "data": [round(float(x), 4) for x in arr.flatten()]
         }
-    
+
     output = {
         "metadata": {
             "board_size": board_size,
             "network_scale": network_scale,
             "n_channels": 5,
             "n_actions": 3,
-            "obs_size": board_size + 2,
+            "obs_size": policy.obs_n,
+            "head_centered": head_centered,
         },
         "weights": weights,
     }
@@ -85,9 +94,11 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--board-size", type=int, default=20)
     parser.add_argument("--network-scale", type=int, default=2)
+    parser.add_argument("--head-centered", action="store_true")
     args = parser.parse_args()
-    
+
     if args.output is None:
         args.output = args.checkpoint.replace(".pt", "_web.json")
-    
-    export_compact(args.checkpoint, args.output, args.board_size, args.network_scale)
+
+    export_compact(args.checkpoint, args.output, args.board_size, args.network_scale,
+                   head_centered=args.head_centered)

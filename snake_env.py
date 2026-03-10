@@ -55,6 +55,11 @@ class SnakeEnv(gym.Env):
         stall_penalty: float = -1.0,
         stall_terminates: bool = True,
         max_no_food_base: Optional[int] = None,
+        flood_fill_obs: bool = False,
+        curriculum_prob: float = 0.0,
+        curriculum_min_fill: float = 0.5,
+        curriculum_max_fill: float = 0.85,
+        head_centered: bool = False,
     ):
         super().__init__()
 
@@ -67,13 +72,21 @@ class SnakeEnv(gym.Env):
         self.survival_bonus = survival_bonus
         self.stall_penalty = stall_penalty
         self.stall_terminates = stall_terminates
+        self.flood_fill_obs = flood_fill_obs
+        self.curriculum_prob = curriculum_prob
+        self.curriculum_min_fill = curriculum_min_fill
+        self.curriculum_max_fill = curriculum_max_fill
+        self.head_centered = head_centered
 
         # Action space: turn left, straight, turn right
         self.action_space = spaces.Discrete(3)
 
-        # Observation space: 5 channels (egocentric), (n+2) x (n+2)
-        self.n_channels = 5
-        self.obs_n = self.n + 2
+        # Observation space: 5 or 6 channels (egocentric)
+        self.n_channels = 6 if flood_fill_obs else 5
+        if head_centered:
+            self.obs_n = 2 * (n - 1) + 1  # 39 for n=20
+        else:
+            self.obs_n = self.n + 2
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
@@ -83,10 +96,11 @@ class SnakeEnv(gym.Env):
 
         self.rng = np.random.default_rng(seed)
         self._walls = np.zeros((self.obs_n, self.obs_n), dtype=np.float32)
-        self._walls[0, :] = 1.0
-        self._walls[-1, :] = 1.0
-        self._walls[:, 0] = 1.0
-        self._walls[:, -1] = 1.0
+        if not head_centered:
+            self._walls[0, :] = 1.0
+            self._walls[-1, :] = 1.0
+            self._walls[:, 0] = 1.0
+            self._walls[:, -1] = 1.0
 
         # Game state (initialized in reset)
         self.snake: list[Tuple[int, int]] = []
@@ -135,9 +149,42 @@ class SnakeEnv(gym.Env):
             # Grid is full (game won)
             self.food_pos = (-1, -1)
 
+    def _flood_fill(self) -> np.ndarray:
+        """Flood-fill reachability from head using scipy connected components."""
+        from scipy.ndimage import label
+
+        n = self.n
+        # Build passable grid (1 = empty, 0 = body)
+        passable = np.ones((n, n), dtype=np.int32)
+        for r, c in self.snake:
+            passable[r, c] = 0
+
+        # Label connected components
+        labels, _ = label(passable)
+
+        # Find which components are reachable from head (head is on body, check neighbors)
+        hr, hc = self.snake_head
+        head_labels = set()
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = hr + dr, hc + dc
+            if 0 <= nr < n and 0 <= nc < n and labels[nr, nc] > 0:
+                head_labels.add(labels[nr, nc])
+
+        if not head_labels:
+            return np.zeros((n, n), dtype=np.float32)
+
+        reachable = np.zeros((n, n), dtype=np.float32)
+        for lbl in head_labels:
+            reachable[labels == lbl] = 1.0
+        reachable[hr, hc] = 1.0  # Mark head position too
+        return reachable
+
     def _get_observation(self) -> np.ndarray:
-        """Snake-centric observation (5 channels, rotated so snake faces 'up')."""
-        obs = np.zeros((5, self.obs_n, self.obs_n), dtype=np.float32)
+        """Snake-centric observation (5 or 6 channels, rotated so snake faces 'up')."""
+        if self.head_centered:
+            return self._get_observation_head_centered()
+
+        obs = np.zeros((self.n_channels, self.obs_n, self.obs_n), dtype=np.float32)
 
         # Channel 0: Head
         hr, hc = self.snake_head
@@ -158,14 +205,99 @@ class SnakeEnv(gym.Env):
         # Channel 4: Walls
         obs[4, :, :] = self._walls
 
+        # Channel 5: Flood-fill reachability from head
+        if self.flood_fill_obs:
+            obs[5, 1:-1, 1:-1] = self._flood_fill()
+
         # Rotate so snake always faces "up" (direction 0)
-        # np.rot90(arr, k) rotates counter-clockwise by k*90 degrees
-        # direction: 0=up, 1=right, 2=down, 3=left
-        # To make direction face up: rotate by direction * 90 degrees CCW
         if self.direction != 0:
             obs = np.rot90(obs, k=self.direction, axes=(1, 2)).copy()
 
         return obs
+
+    def _get_observation_head_centered(self) -> np.ndarray:
+        """Head-centered observation: head always at grid center, 39x39 for n=20."""
+        obs = np.zeros((self.n_channels, self.obs_n, self.obs_n), dtype=np.float32)
+        hr, hc = self.snake_head
+        c = self.obs_n // 2  # center index (19 for 39x39)
+
+        # Channel 0: Head (always at center)
+        obs[0, c, c] = 1.0
+
+        # Channel 1: Body (includes head)
+        for r, col in self.snake:
+            obs[1, r - hr + c, col - hc + c] = 1.0
+
+        # Channel 2: Food
+        fr, fc = self.food_pos
+        if fr >= 0:
+            obs[2, fr - hr + c, fc - hc + c] = 1.0
+
+        # Channel 3: Normalized length (broadcast)
+        obs[3, :, :] = self.snake_length / float(self.n * self.n)
+
+        # Channel 4: Walls (everything outside the board)
+        row_board = np.arange(self.obs_n) + hr - c
+        col_board = np.arange(self.obs_n) + hc - c
+        obs[4] = ((row_board < 0) | (row_board >= self.n))[:, None] | \
+                  ((col_board < 0) | (col_board >= self.n))[None, :]
+
+        # Channel 5: Flood-fill reachability
+        if self.flood_fill_obs:
+            ff = self._flood_fill()
+            # Compute overlap between grid and board
+            gr_start = max(0, c - hr)
+            gc_start = max(0, c - hc)
+            br_start = max(0, hr - c)
+            bc_start = max(0, hc - c)
+            h = min(self.n - br_start, self.obs_n - gr_start)
+            w = min(self.n - bc_start, self.obs_n - gc_start)
+            obs[5, gr_start:gr_start+h, gc_start:gc_start+w] = \
+                ff[br_start:br_start+h, bc_start:bc_start+w]
+
+        # Rotate so snake always faces "up"
+        if self.direction != 0:
+            obs = np.rot90(obs, k=self.direction, axes=(1, 2)).copy()
+
+        return obs
+
+    def _build_hamiltonian_path(self) -> list:
+        """Build a zigzag Hamiltonian path covering the entire board."""
+        path = []
+        for r in range(self.n):
+            if r % 2 == 0:
+                for c in range(self.n):
+                    path.append((r, c))
+            else:
+                for c in range(self.n - 1, -1, -1):
+                    path.append((r, c))
+        return path
+
+    def _reset_with_fill(self) -> None:
+        """Curriculum reset: place snake along a zigzag path at random fill level."""
+        board_area = self.n * self.n
+        min_len = max(3, int(self.curriculum_min_fill * board_area))
+        max_len = min(board_area - 1, int(self.curriculum_max_fill * board_area))
+        target_len = int(self.rng.integers(min_len, max_len + 1))
+
+        # Build a zigzag path and pick a random starting offset
+        path = self._build_hamiltonian_path()
+        max_start = len(path) - target_len
+        start_idx = int(self.rng.integers(0, max(1, max_start + 1)))
+
+        # Snake: head is at start_idx, body follows along the path
+        self.snake = path[start_idx : start_idx + target_len]
+
+        # Set direction based on head → first body segment
+        hr, hc = self.snake[0]
+        br, bc = self.snake[1]
+        dr, dc = hr - br, hc - bc
+        for d, (ddr, ddc) in self.DIRECTIONS.items():
+            if (ddr, ddc) == (dr, dc):
+                self.direction = d
+                break
+        else:
+            self.direction = int(self.rng.integers(4))
 
     def reset(
         self,
@@ -177,25 +309,24 @@ class SnakeEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
-        center = self.n // 2
-
-        # Random initial direction
-        self.direction = int(self.rng.integers(4))
-
-        # Build snake aligned with direction
-        dr, dc = self.DIRECTIONS[self.direction]
-        self.snake = []
-        for i in range(3):
-            r = center - i * dr
-            c = center - i * dc
-            r = max(0, min(self.n - 1, r))
-            c = max(0, min(self.n - 1, c))
-            self.snake.append((r, c))
+        if self.curriculum_prob > 0 and self.rng.random() < self.curriculum_prob:
+            self._reset_with_fill()
+        else:
+            center = self.n // 2
+            self.direction = int(self.rng.integers(4))
+            dr, dc = self.DIRECTIONS[self.direction]
+            self.snake = []
+            for i in range(3):
+                r = center - i * dr
+                c = center - i * dc
+                r = max(0, min(self.n - 1, r))
+                c = max(0, min(self.n - 1, c))
+                self.snake.append((r, c))
 
         self._place_food()
 
         self.steps_since_food = 0
-        self.score = 0
+        self.score = max(0, self.snake_length - 3)
         self.total_steps = 0
         self.prev_phi = self._compute_phi()
 

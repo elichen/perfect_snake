@@ -23,6 +23,7 @@ import numpy as np
 import psutil
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import pufferlib
 import pufferlib.emulation
@@ -119,6 +120,11 @@ def make_snake_env(
     stall_penalty: float = -1.0,
     stall_terminates: bool = True,
     max_no_food_base: int = None,
+    flood_fill_obs: bool = False,
+    curriculum_prob: float = 0.0,
+    curriculum_min_fill: float = 0.5,
+    curriculum_max_fill: float = 0.85,
+    head_centered: bool = False,
     buf=None,
     seed=None,
 ):
@@ -131,6 +137,11 @@ def make_snake_env(
         stall_penalty=stall_penalty,
         stall_terminates=stall_terminates,
         max_no_food_base=max_no_food_base,
+        flood_fill_obs=flood_fill_obs,
+        curriculum_prob=curriculum_prob,
+        curriculum_min_fill=curriculum_min_fill,
+        curriculum_max_fill=curriculum_max_fill,
+        head_centered=head_centered,
     )
     if symmetric:
         env = SnakeSymmetricAugmentation(env, flip_prob=0.5, seed=seed)
@@ -145,14 +156,29 @@ class SnakePolicy(nn.Module):
     Scale 2x: obs -> 2048 -> 1024 -> 512 -> 256
     """
 
-    def __init__(self, env, scale: int = 1):
+    def __init__(self, env, scale: int = 1, aux_flood_fill: bool = False,
+                 board_size: int = None, head_centered: bool = False):
         super().__init__()
 
         obs_space = getattr(env, "single_observation_space", env.observation_space)
         act_space = getattr(env, "single_action_space", env.action_space)
         obs_shape = obs_space.shape
-        n_input = int(np.prod(obs_shape))
+        total_channels = obs_shape[0]
         n_actions = act_space.n
+
+        self.aux_flood_fill = aux_flood_fill
+        self.head_centered = head_centered
+        if aux_flood_fill:
+            self.encoder_channels = total_channels - 1
+        else:
+            self.encoder_channels = total_channels
+
+        # Compute input size from encoder channels
+        n_input = self.encoder_channels * obs_shape[1] * obs_shape[2]
+        if board_size is not None:
+            self.board_size = board_size
+        else:
+            self.board_size = obs_shape[1] - 2  # strip wall padding (non-head-centered)
 
         # Scale network width
         w = [1024, 512, 256, 128]
@@ -190,6 +216,20 @@ class SnakePolicy(nn.Module):
             nn.Linear(w[3] // 2, 1),
         )
 
+        # Auxiliary flood-fill decoder (training only)
+        if aux_flood_fill:
+            if head_centered:
+                # Head-centered: predict full obs grid (no fixed wall border to strip)
+                self.flood_target_n = obs_shape[1]
+            else:
+                # Non-head-centered: predict inner board grid (strip wall padding)
+                self.flood_target_n = self.board_size
+            self.flood_decoder = nn.Sequential(
+                nn.Linear(w[3], w[2]),
+                nn.ReLU(),
+                nn.Linear(w[2], self.flood_target_n * self.flood_target_n),
+            )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -199,13 +239,21 @@ class SnakePolicy(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def forward_eval(self, observations, state=None):
-        features = self.features(observations)
+        obs_input = observations[:, :self.encoder_channels]
+        features = self.features(obs_input)
         logits = self.policy_head(features)
         values = self.value_head(features)
         return logits, values
 
     def forward(self, observations, state=None):
         return self.forward_eval(observations, state)
+
+    def forward_flood_predict(self, enc_input):
+        """Predict flood-fill from encoder input. Returns (B, 1, n, n) logits."""
+        features = self.features(enc_input)
+        pred = self.flood_decoder(features)
+        n = self.flood_target_n
+        return pred.view(-1, 1, n, n)
 
 
 class SnakeCNNPolicy(nn.Module):
@@ -288,6 +336,253 @@ class SnakeCNNPolicy(nn.Module):
         return self.forward_eval(observations, state)
 
 
+class ResBlock(nn.Module):
+    """Pre-activation residual block (BN -> ReLU -> Conv -> BN -> ReLU -> Conv)."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class SnakeResNetPolicy(nn.Module):
+    """Deep ResNet policy — maintains spatial resolution for iterative reasoning.
+
+    No pooling/striding: all conv layers see full 22x22 grid.
+    With N residual blocks (2 conv layers each), receptive field ≈ 2*N+1.
+    15 blocks → RF=31, enough to span the 22x22 grid.
+    """
+
+    def __init__(self, env, scale: int = 1):
+        super().__init__()
+
+        obs_space = getattr(env, "single_observation_space", env.observation_space)
+        act_space = getattr(env, "single_action_space", env.action_space)
+        obs_shape = obs_space.shape  # (C, H, W)
+        n_channels = obs_shape[0]
+        n_actions = act_space.n
+
+        # Scale: channels and number of residual blocks
+        if scale >= 4:
+            channels = 128
+            n_blocks = 19
+        elif scale >= 2:
+            channels = 64
+            n_blocks = 15
+        else:
+            channels = 32
+            n_blocks = 10
+
+        # Initial projection
+        self.input_conv = nn.Conv2d(n_channels, channels, 3, padding=1, bias=False)
+
+        # Residual tower (no spatial downsampling)
+        self.res_tower = nn.Sequential(*[ResBlock(channels) for _ in range(n_blocks)])
+        self.post_bn = nn.BatchNorm2d(channels)
+        self.post_relu = nn.ReLU()
+
+        # Global average pool → small feature vector
+        self.gap = nn.AdaptiveAvgPool2d(1)
+
+        self.policy_head = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.ReLU(),
+            nn.Linear(channels, n_actions),
+        )
+
+        self.value_head = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.ReLU(),
+            nn.Linear(channels, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward_eval(self, observations, state=None):
+        x = self.input_conv(observations)
+        x = self.res_tower(x)
+        x = self.post_relu(self.post_bn(x))
+        x = self.gap(x).flatten(1)
+        logits = self.policy_head(x)
+        values = self.value_head(x)
+        return logits, values
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
+
+class IterativeBlock(nn.Module):
+    """Weight-tied convolutional block for iterative spatial reasoning.
+
+    Same local operation applied K times with shared weights, simulating
+    BFS/flood-fill diffusion. K iterations of 3x3 conv covers RF of 2K+1.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        n_groups = min(8, channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.gn1 = nn.GroupNorm(n_groups, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.gn2 = nn.GroupNorm(n_groups, channels)
+
+    def forward(self, x):
+        residual = x
+        out = torch.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
+        return torch.relu(out + residual)
+
+
+class SnakeIterativeCNNPolicy(nn.Module):
+    """Weight-tied iterative CNN for learning spatial reasoning.
+
+    A single conv block applied K times with shared weights provides the
+    inductive bias for BFS/flood-fill-like computation. K iterations of
+    3x3 convolution covers receptive field of 2K+1.
+
+    With aux_flood_fill=True, the encoder only processes N-1 channels
+    (excluding the last flood-fill channel) and a decoder head is trained
+    to predict flood-fill from the learned spatial features.
+    """
+
+    def __init__(self, env=None, scale: int = 1, n_iterations: int = 12,
+                 aux_flood_fill: bool = False, *,
+                 board_size: int = None, n_channels: int = None):
+        super().__init__()
+
+        if env is not None:
+            obs_space = getattr(env, "single_observation_space", env.observation_space)
+            act_space = getattr(env, "single_action_space", env.action_space)
+            total_channels = obs_space.shape[0]
+            n_actions = act_space.n
+        else:
+            assert board_size is not None and n_channels is not None
+            total_channels = n_channels
+            n_actions = 3
+
+        if scale >= 4:
+            channels = 128
+            hidden = 512
+        elif scale >= 2:
+            channels = 64
+            hidden = 256
+        else:
+            channels = 32
+            hidden = 128
+
+        self.n_iterations = n_iterations
+        self.aux_flood_fill = aux_flood_fill
+        self.channels = channels
+
+        # Encoder processes all channels, or strips flood-fill target
+        if aux_flood_fill:
+            self.encoder_channels = total_channels - 1
+        else:
+            self.encoder_channels = total_channels
+
+        n_groups = min(8, channels)
+
+        # Input projection
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(self.encoder_channels, channels, 3, padding=1, bias=False),
+            nn.GroupNorm(n_groups, channels),
+            nn.ReLU(),
+        )
+
+        # Weight-tied iterative block (shared weights across all iterations)
+        self.iter_block = IterativeBlock(channels)
+
+        # Post-iteration normalization
+        self.post_norm = nn.GroupNorm(n_groups, channels)
+
+        # Global average pooling
+        self.gap = nn.AdaptiveAvgPool2d(1)
+
+        # Actor head
+        self.policy_head = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, n_actions),
+        )
+
+        # Critic head
+        self.value_head = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, 1),
+        )
+
+        # Auxiliary flood-fill decoder (training only, dropped at eval)
+        if aux_flood_fill:
+            self.flood_decoder = nn.Sequential(
+                nn.Conv2d(channels, channels // 2, 3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(channels // 2, 1, 1),
+            )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.GroupNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward_spatial(self, observations):
+        """Compute spatial features via weight-tied iterative convolution."""
+        x = self.input_conv(observations)
+        for _ in range(self.n_iterations):
+            x = self.iter_block(x)
+        x = torch.relu(self.post_norm(x))
+        return x
+
+    def forward_eval(self, observations, state=None):
+        obs_input = observations[:, :self.encoder_channels]
+        spatial = self.forward_spatial(obs_input)
+        features = self.gap(spatial).flatten(1)
+        logits = self.policy_head(features)
+        values = self.value_head(features)
+        return logits, values
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
+    def forward_flood_predict(self, enc_input):
+        """Predict flood-fill from encoder input. Returns (B, 1, n, n) logits."""
+        spatial = self.forward_spatial(enc_input)
+        pred = self.flood_decoder(spatial)
+        return pred[:, :, 1:-1, 1:-1]  # strip wall padding
+
+
 def _auto_num_workers(num_envs: int) -> int:
     try:
         physical = psutil.cpu_count(logical=False) or 1
@@ -311,8 +606,10 @@ def evaluate_policy(
     deterministic: bool,
     gamma: float,
     alpha: float,
+    flood_fill_obs: bool = False,
+    head_centered: bool = False,
 ) -> dict:
-    env = SnakeEnv(n=board_size, gamma=gamma, alpha=alpha, seed=seed)
+    env = SnakeEnv(n=board_size, gamma=gamma, alpha=alpha, seed=seed, flood_fill_obs=flood_fill_obs, head_centered=head_centered)
 
     perfect_score = board_size * board_size - 3
     scores = []
@@ -390,6 +687,13 @@ def main():
         help="Final LR ratio for cosine anneal (0.0 = decay to 0, 0.1 ~= 3e-4->3e-5)",
     )
     parser.add_argument("--no-anneal-lr", action="store_true", help="Disable LR annealing")
+    parser.add_argument(
+        "--lr-decay-steps",
+        type=int,
+        default=0,
+        help="Decay LR over this many steps (0 = use total timesteps). "
+             "After decay completes, LR stays at min_lr.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--horizon", type=int, default=128, help="Steps per env per epoch")
     parser.add_argument(
@@ -408,6 +712,18 @@ def main():
     parser.add_argument("--symmetric", action="store_true", help="Enable symmetric augmentation (50%% horizontal flip)")
     parser.add_argument("--network-scale", type=int, default=1, choices=[1, 2, 4], help="Network width multiplier (1=base, 2=2x, 4=4x)")
     parser.add_argument("--cnn", action="store_true", help="Use CNN policy instead of MLP")
+    parser.add_argument("--resnet", action="store_true", help="Use deep ResNet policy (spatial reasoning)")
+    parser.add_argument("--iterative-cnn", action="store_true", help="Use weight-tied iterative CNN policy")
+    parser.add_argument("--n-iterations", type=int, default=12, help="Iterations for iterative CNN (RF = 2K+1)")
+    parser.add_argument("--aux-flood-fill", action="store_true", help="Train auxiliary flood-fill decoder (requires --flood-fill)")
+    parser.add_argument("--aux-flood-fill-coef", type=float, default=1.0, help="Weight for auxiliary flood-fill loss")
+    parser.add_argument("--flood-fill", action="store_true", help="Add flood-fill reachability observation channel")
+    parser.add_argument("--curriculum-prob", type=float, default=0.0, help="Fraction of episodes starting at random fill level (0 = disabled)")
+    parser.add_argument("--curriculum-min-fill", type=float, default=0.5, help="Minimum fill level for curriculum spawning")
+    parser.add_argument("--curriculum-max-fill", type=float, default=0.85, help="Maximum fill level for curriculum spawning")
+    parser.add_argument("--head-centered", action="store_true", default=False, help="Head-centered observation (39x39 for 20x20 board)")
+    parser.add_argument("--gae-lambda", type=float, default=0.95, help="GAE lambda")
+    parser.add_argument("--vf-clip-coef", type=float, default=0.2, help="Value function clip coefficient")
     parser.add_argument("--stall-penalty", type=float, default=-1.0, help="Penalty for stalling (default: -1.0, same as death)")
     parser.add_argument("--stall-terminates", action="store_true", default=True, help="Stall ends episode (terminated=True, not truncated)")
     parser.add_argument("--no-stall-terminates", action="store_false", dest="stall_terminates", help="Stall truncates instead of terminates")
@@ -440,6 +756,11 @@ def main():
         raise SystemExit("--num-envs must be >= 1")
     if args.horizon < 1:
         raise SystemExit("--horizon must be >= 1")
+    if args.aux_flood_fill and not args.flood_fill:
+        raise SystemExit("--aux-flood-fill requires --flood-fill (for ground truth)")
+    if args.aux_flood_fill and not args.iterative_cnn:
+        # MLP with aux flood-fill decoder - supported
+        pass
 
     resume_state = None
     resume_steps = 0
@@ -480,6 +801,11 @@ def main():
         stall_penalty=args.stall_penalty,
         stall_terminates=args.stall_terminates,
         max_no_food_base=args.max_no_food_base,
+        flood_fill_obs=args.flood_fill,
+        curriculum_prob=args.curriculum_prob,
+        curriculum_min_fill=args.curriculum_min_fill,
+        curriculum_max_fill=args.curriculum_max_fill,
+        head_centered=args.head_centered,
     )
     vec_kwargs = dict(
         num_envs=args.num_envs,
@@ -491,10 +817,17 @@ def main():
         vec_kwargs["num_workers"] = num_workers
     vecenv = pufferlib.vector.make(make_snake_env, **vec_kwargs)
 
-    if args.cnn:
+    if args.iterative_cnn:
+        policy = SnakeIterativeCNNPolicy(
+            vecenv.driver_env, scale=args.network_scale,
+            n_iterations=args.n_iterations, aux_flood_fill=args.aux_flood_fill,
+        ).to(args.device)
+    elif args.resnet:
+        policy = SnakeResNetPolicy(vecenv.driver_env, scale=args.network_scale).to(args.device)
+    elif args.cnn:
         policy = SnakeCNNPolicy(vecenv.driver_env, scale=args.network_scale).to(args.device)
     else:
-        policy = SnakePolicy(vecenv.driver_env, scale=args.network_scale).to(args.device)
+        policy = SnakePolicy(vecenv.driver_env, scale=args.network_scale, aux_flood_fill=args.aux_flood_fill, board_size=args.board_size, head_centered=args.head_centered).to(args.device)
 
     if args.resume:
         state = torch.load(args.resume, map_location="cpu")
@@ -542,11 +875,11 @@ def main():
         "anneal_lr": not bool(args.no_anneal_lr),
         "min_lr_ratio": float(args.min_lr_ratio),
         "gamma": float(args.gamma),
-        "gae_lambda": 0.95,
+        "gae_lambda": float(args.gae_lambda),
         "update_epochs": int(args.update_epochs),
         "clip_coef": 0.1,
         "vf_coef": 1.0,
-        "vf_clip_coef": 0.2,
+        "vf_clip_coef": float(args.vf_clip_coef),
         "max_grad_norm": 0.5,
         "ent_coef": float(args.ent_coef),
         "adam_beta1": 0.9,
@@ -571,6 +904,28 @@ def main():
     trainer = pufferl.PuffeRL(config, vecenv, policy)
     if not args.dashboard:
         trainer.print_dashboard = lambda *_, **__: None
+
+    # Override scheduler if --lr-decay-steps is set
+    if args.lr_decay_steps > 0:
+        import math
+        batch_size = config["batch_size"]
+        decay_epochs = args.lr_decay_steps // batch_size
+        min_ratio = float(args.min_lr_ratio)
+
+        def lr_lambda(epoch):
+            if epoch >= decay_epochs:
+                return min_ratio
+            return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * epoch / decay_epochs))
+
+        trainer.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            trainer.optimizer, lr_lambda=lr_lambda,
+        )
+        min_lr = float(args.lr) * min_ratio
+        print(
+            f"LR schedule: cosine decay over {args.lr_decay_steps/1e6:.0f}M steps "
+            f"({decay_epochs} epochs), then constant at {min_lr:.1e}",
+            file=sys.stderr,
+        )
 
     if resume_state is not None:
         if "optimizer_state_dict" in resume_state:
@@ -623,13 +978,55 @@ def main():
     except Exception as exc:
         print(f"experiment_tracker_disabled: {exc}", file=sys.stderr)
 
+    # Auxiliary flood-fill decoder training setup
+    aux_flood_fill_active = args.aux_flood_fill and args.aux_flood_fill_coef > 0
+    if aux_flood_fill_active:
+        obs_shape = vecenv.driver_env.observation_space.shape
+        print(f"aux_flood_fill: coef={args.aux_flood_fill_coef}, "
+              f"encoder_channels={policy.encoder_channels}, "
+              f"total_channels={obs_shape[0]}", file=sys.stderr)
+
     start_time = time.time()
     last_logs = None
     last_eval_at = 0
     perfect_streak = 0
+    last_aux_loss = None
     while trainer.epoch < trainer.total_epochs:
         trainer.evaluate()
         logs = trainer.train()
+
+        # Auxiliary flood-fill decoder training step
+        if aux_flood_fill_active and logs is not None:
+            obs_buf = trainer.observations
+            # Reshape from (segments, horizon, C, H, W) to (N, C, H, W)
+            flat_obs = obs_buf.reshape(-1, *obs_buf.shape[2:])
+            n_total = flat_obs.shape[0]
+            aux_batch = min(2048, n_total)
+            idx = torch.randperm(n_total, device=flat_obs.device)[:aux_batch]
+            mb = flat_obs[idx]
+            if mb.device != torch.device(args.device):
+                mb = mb.to(args.device)
+
+            enc_input = mb[:, :policy.encoder_channels]
+            # Flood-fill target is the channel right after encoder channels
+            target = mb[:, policy.encoder_channels:policy.encoder_channels + 1]
+            if policy.head_centered:
+                # Head-centered: predict full obs grid (no fixed wall border)
+                target_inner = target
+            else:
+                # Non-head-centered: strip wall padding to get inner board grid
+                target_inner = target[:, :, 1:-1, 1:-1]
+
+            pred_inner = policy.forward_flood_predict(enc_input)
+
+            aux_loss = F.binary_cross_entropy_with_logits(pred_inner, target_inner)
+            last_aux_loss = aux_loss.item()
+
+            trainer.optimizer.zero_grad()
+            (aux_loss * args.aux_flood_fill_coef).backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+            trainer.optimizer.step()
+
         if logs is not None:
             last_logs = logs
             sps = logs.get("SPS", 0)
@@ -655,6 +1052,8 @@ def main():
                 extra.append(f"ep_score={ep_score:.2f}")
             if win_rate is not None:
                 extra.append(f"win={win_rate*100:.1f}%")
+            if last_aux_loss is not None:
+                extra.append(f"aux={last_aux_loss:.4f}")
             extra = (" | " + " ".join(extra)) if extra else ""
             print(f"steps={agent_steps:,} | SPS={sps:,.0f}{extra}")
 
@@ -670,6 +1069,8 @@ def main():
                     deterministic=args.eval_deterministic,
                     gamma=float(args.gamma),
                     alpha=float(args.alpha),
+                    flood_fill_obs=args.flood_fill,
+                    head_centered=args.head_centered,
                 )
                 mean_score = stats["mean_score"]
                 win_rate = stats["win_rate"]
@@ -705,6 +1106,7 @@ def main():
                 checkpoint_path = os.path.join(
                     tracker.run_dir, f"model_{config['env']}_{trainer.epoch:06d}.pt"
                 )
+                torch.save(policy.state_dict(), checkpoint_path)
                 tracker.log_checkpoint(
                     checkpoint_path,
                     epoch=trainer.epoch,

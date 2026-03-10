@@ -17,12 +17,24 @@ from snake_env import SnakeEnv
 class SnakePolicy(nn.Module):
     """FC policy for Snake (must match train.py architecture)."""
 
-    def __init__(self, board_size: int, scale: int = 1):
+    def __init__(self, board_size: int, scale: int = 1, n_channels: int = 5,
+                 aux_flood_fill: bool = False, head_centered: bool = False):
         super().__init__()
 
-        n_channels = 5
-        obs_shape = (n_channels, board_size + 2, board_size + 2)
-        n_input = int(np.prod(obs_shape))
+        self.aux_flood_fill = aux_flood_fill
+        total_channels = n_channels
+        if aux_flood_fill:
+            self.encoder_channels = total_channels - 1
+        else:
+            self.encoder_channels = total_channels
+
+        if head_centered:
+            obs_n = 2 * (board_size - 1) + 1
+        else:
+            obs_n = board_size + 2
+        obs_shape = (total_channels, obs_n, obs_n)
+        n_input = self.encoder_channels * obs_n * obs_n
+        self.board_size = board_size
         n_actions = 3
 
         w = [1024, 512, 256, 128]
@@ -60,8 +72,20 @@ class SnakePolicy(nn.Module):
             nn.Linear(w[3] // 2, 1),
         )
 
+        if aux_flood_fill:
+            if head_centered:
+                flood_target_n = obs_n
+            else:
+                flood_target_n = board_size
+            self.flood_decoder = nn.Sequential(
+                nn.Linear(w[3], w[2]),
+                nn.ReLU(),
+                nn.Linear(w[2], flood_target_n * flood_target_n),
+            )
+
     def forward(self, observations, state=None):
-        features = self.features(observations)
+        obs_input = observations[:, :self.encoder_channels]
+        features = self.features(obs_input)
         logits = self.policy_head(features)
         values = self.value_head(features)
         return logits, values
@@ -157,17 +181,23 @@ def play_game(
     network_scale: int,
     delay: float,
     deterministic: bool,
+    flood_fill: bool = False,
+    aux_flood_fill: bool = False,
+    head_centered: bool = False,
 ) -> dict:
     """Play one game with visualization."""
 
     # Load policy
-    policy = SnakePolicy(board_size, scale=network_scale).to(device)
+    n_channels = 6 if flood_fill else 5
+    policy = SnakePolicy(board_size, scale=network_scale, n_channels=n_channels,
+                         aux_flood_fill=aux_flood_fill, head_centered=head_centered).to(device)
     state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
     policy.load_state_dict(state_dict, strict=True)
     policy.eval()
 
     # Create env
-    env = SnakeEnv(n=board_size, gamma=0.99, alpha=0.2, seed=seed)
+    env = SnakeEnv(n=board_size, gamma=0.99, alpha=0.2, seed=seed,
+                   flood_fill_obs=flood_fill, head_centered=head_centered)
     perfect_score = board_size * board_size - 3
 
     obs, info = env.reset(seed=seed)
@@ -248,6 +278,9 @@ def main():
     parser.add_argument("--delay", type=float, default=0.05, help="Delay between frames in seconds")
     parser.add_argument("--stochastic", action="store_true", help="Use stochastic policy (default: deterministic)")
     parser.add_argument("--games", type=int, default=1, help="Number of games to play")
+    parser.add_argument("--flood-fill", action="store_true", help="Use flood-fill observation channel")
+    parser.add_argument("--aux-flood-fill", action="store_true", help="Model has aux flood-fill decoder")
+    parser.add_argument("--head-centered", action="store_true", help="Head-centered observation")
     args = parser.parse_args()
 
     if args.seed is None:
@@ -277,6 +310,9 @@ def main():
                 network_scale=args.network_scale,
                 delay=args.delay,
                 deterministic=not args.stochastic,
+                flood_fill=args.flood_fill,
+                aux_flood_fill=args.aux_flood_fill,
+                head_centered=args.head_centered,
             )
 
             if result.get("interrupted"):
