@@ -1,6 +1,6 @@
 """Snake environment for RL training.
 
-Observation: 5-channel tensor (n+2, n+2), snake-centric (egocentric)
+Observation: 5+ channel tensor (n+2, n+2), snake-centric (egocentric)
   Grid is rotated so snake always faces "up" (forward).
   - Ch 0: head (one-hot)
   - Ch 1: body (one-hot, includes head)
@@ -13,7 +13,8 @@ Actions: 0=turn left, 1=straight, 2=turn right (relative)
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, Optional, Tuple
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -24,7 +25,7 @@ class SnakeEnv(gym.Env):
     """
     Snake game environment for RL training.
 
-    Observation (float32): 5-channel (n+2) x (n+2), snake-centric (egocentric).
+    Observation (float32): 5+ channel (n+2) x (n+2), snake-centric (egocentric).
     Grid is rotated so snake always faces "up".
 
     Action space: Discrete(3)
@@ -56,9 +57,29 @@ class SnakeEnv(gym.Env):
         stall_terminates: bool = True,
         max_no_food_base: Optional[int] = None,
         flood_fill_obs: bool = False,
+        body_age_obs: bool = False,
+        obs_history: int = 1,
+        action_history_obs: int = 0,
         curriculum_prob: float = 0.0,
         curriculum_min_fill: float = 0.5,
         curriculum_max_fill: float = 0.85,
+        curriculum_follow_bonus: float = 0.0,
+        curriculum_follow_min_fill: float = 0.85,
+        cycle_target_obs: bool = False,
+        tail_target_obs: bool = False,
+        safe_action_target_obs: bool = False,
+        safe_action_soft_target_obs: bool = False,
+        body_age_target_obs: bool = False,
+        body_age_obs_min_fill: float = 0.90,
+        cycle_target_min_fill: Optional[float] = None,
+        safe_action_target_min_fill: float = 0.90,
+        safe_action_soft_target_min_fill: float = 0.90,
+        body_age_target_min_fill: float = 0.80,
+        safe_action_fill_weight: float = 500.0,
+        safe_action_soft_temperature: float = 1.0,
+        safe_action_bonus: float = 0.0,
+        safe_action_bonus_min_fill: float = 0.95,
+        safe_action_bonus_fill_weight: float = 500.0,
         head_centered: bool = False,
     ):
         super().__init__()
@@ -73,16 +94,60 @@ class SnakeEnv(gym.Env):
         self.stall_penalty = stall_penalty
         self.stall_terminates = stall_terminates
         self.flood_fill_obs = flood_fill_obs
+        self.body_age_obs = body_age_obs
+        self.obs_history = max(1, int(obs_history))
+        self.action_history_obs = max(0, int(action_history_obs))
         self.curriculum_prob = curriculum_prob
         self.curriculum_min_fill = curriculum_min_fill
         self.curriculum_max_fill = curriculum_max_fill
+        self.curriculum_follow_bonus = curriculum_follow_bonus
+        self.curriculum_follow_min_fill = curriculum_follow_min_fill
+        self.cycle_target_obs = cycle_target_obs
+        self.tail_target_obs = tail_target_obs
+        self.safe_action_target_obs = safe_action_target_obs
+        self.safe_action_soft_target_obs = safe_action_soft_target_obs
+        self.body_age_target_obs = body_age_target_obs
+        self.body_age_obs_min_fill = body_age_obs_min_fill
+        self.cycle_target_min_fill = (
+            curriculum_follow_min_fill
+            if cycle_target_min_fill is None
+            else cycle_target_min_fill
+        )
+        self.safe_action_target_min_fill = safe_action_target_min_fill
+        self.safe_action_soft_target_min_fill = safe_action_soft_target_min_fill
+        self.body_age_target_min_fill = body_age_target_min_fill
+        self.safe_action_fill_weight = safe_action_fill_weight
+        self.safe_action_soft_temperature = safe_action_soft_temperature
+        self.safe_action_bonus = safe_action_bonus
+        self.safe_action_bonus_min_fill = safe_action_bonus_min_fill
+        self.safe_action_bonus_fill_weight = safe_action_bonus_fill_weight
         self.head_centered = head_centered
 
         # Action space: turn left, straight, turn right
         self.action_space = spaces.Discrete(3)
 
-        # Observation space: 5 or 6 channels (egocentric)
-        self.n_channels = 6 if flood_fill_obs else 5
+        # Observation space:
+        # encoder-visible channels are current-frame-first, then prior frames,
+        # followed by single-frame auxiliary training targets.
+        self.action_history_channels = 3 * self.action_history_obs
+        self.base_obs_channels = 5 + int(flood_fill_obs) + int(body_age_obs) + self.action_history_channels
+        self.encoder_visible_channels = self.base_obs_channels * self.obs_history
+        self.flood_fill_channel = 5 if flood_fill_obs else None
+        self.body_age_obs_channel = 5 + int(flood_fill_obs) if body_age_obs else None
+        next_channel = self.base_obs_channels
+        self.cycle_target_channel = next_channel if cycle_target_obs else None
+        next_channel += int(cycle_target_obs)
+        self.tail_target_channel = next_channel if tail_target_obs else None
+        next_channel += int(tail_target_obs)
+        self.safe_action_target_channel = next_channel if safe_action_target_obs else None
+        next_channel += int(safe_action_target_obs)
+        self.safe_action_soft_target_channel = next_channel if safe_action_soft_target_obs else None
+        next_channel += 3 * int(safe_action_soft_target_obs)
+        self.body_age_target_channel = next_channel if body_age_target_obs else None
+        next_channel += int(body_age_target_obs)
+        self.aux_target_channels = next_channel - self.base_obs_channels
+        self.single_frame_n_channels = next_channel
+        self.n_channels = self.encoder_visible_channels + self.aux_target_channels
         if head_centered:
             self.obs_n = 2 * (n - 1) + 1  # 39 for n=20
         else:
@@ -95,6 +160,9 @@ class SnakeEnv(gym.Env):
         )
 
         self.rng = np.random.default_rng(seed)
+        self._obs_history_frames: Deque[np.ndarray] = deque(maxlen=max(0, self.obs_history - 1))
+        self._history_zero_frame: np.ndarray | None = None
+        self._action_history: Deque[int] = deque(maxlen=self.action_history_obs)
         self._walls = np.zeros((self.obs_n, self.obs_n), dtype=np.float32)
         if not head_centered:
             self._walls[0, :] = 1.0
@@ -110,6 +178,9 @@ class SnakeEnv(gym.Env):
         self.score: int = 0
         self.prev_phi: float = 0.0
         self.total_steps: int = 0
+        self._curriculum_cycles = self._build_curriculum_cycles()
+        self._curriculum_cycle: Optional[list[Tuple[int, int]]] = None
+        self._curriculum_head_idx: Optional[int] = None
 
     @property
     def snake_head(self) -> Tuple[int, int]:
@@ -179,12 +250,89 @@ class SnakeEnv(gym.Env):
         reachable[hr, hc] = 1.0  # Mark head position too
         return reachable
 
-    def _get_observation(self) -> np.ndarray:
-        """Snake-centric observation (5 or 6 channels, rotated so snake faces 'up')."""
+    def _current_cycle_target(self) -> Optional[Tuple[int, int]]:
+        if not self.cycle_target_obs:
+            return None
+        if self._curriculum_cycle is None or self._curriculum_head_idx is None:
+            return None
+        if self.snake_length / float(self.n * self.n) < self.cycle_target_min_fill:
+            return None
+        next_idx = (self._curriculum_head_idx - 1) % len(self._curriculum_cycle)
+        return self._curriculum_cycle[next_idx]
+
+    def _current_tail_target(self) -> Optional[Tuple[int, int]]:
+        if not self.tail_target_obs or not self.snake:
+            return None
+        return self.snake[-1]
+
+    def _current_safe_action_target(self) -> Optional[Tuple[int, int]]:
+        if not self.safe_action_target_obs or not self.snake:
+            return None
+        if self.snake_length / float(self.n * self.n) < self.safe_action_target_min_fill:
+            return None
+
+        scores = self.score_relative_actions(fill_weight=self.safe_action_fill_weight)
+        if not np.isfinite(np.max(scores)):
+            return None
+
+        action = int(np.argmax(scores))
+        delta = {0: -1, 1: 0, 2: 1}
+        new_dir = (self.direction + delta[action]) % 4
+        dr, dc = self.DIRECTIONS[new_dir]
+        hr, hc = self.snake_head
+        return (hr + dr, hc + dc)
+
+    def _current_safe_action_soft_target(self) -> Optional[np.ndarray]:
+        if not self.safe_action_soft_target_obs or not self.snake:
+            return None
+        if self.snake_length / float(self.n * self.n) < self.safe_action_soft_target_min_fill:
+            return None
+
+        raw_scores = np.asarray(
+            self.score_relative_actions(fill_weight=self.safe_action_fill_weight),
+            dtype=np.float32,
+        )
+        finite_mask = np.isfinite(raw_scores)
+        if not np.any(finite_mask):
+            return None
+
+        logits = np.full(3, -np.inf, dtype=np.float32)
+        finite_scores = raw_scores[finite_mask]
+        max_score = float(np.max(finite_scores))
+        temp = max(float(self.safe_action_soft_temperature), 1e-6)
+        logits[finite_mask] = (raw_scores[finite_mask] - max_score) / temp
+        weights = np.exp(logits - np.max(logits[finite_mask]))
+        weights[~finite_mask] = 0.0
+        total = float(np.sum(weights))
+        if total <= 0.0:
+            return None
+        return (weights / total).astype(np.float32)
+
+    def _body_age_map(self, min_fill: float) -> Optional[np.ndarray]:
+        if not self.snake:
+            return None
+        if self.snake_length / float(self.n * self.n) < min_fill:
+            return None
+
+        target = np.zeros((self.n, self.n), dtype=np.float32)
+        denom = float(self.n * self.n)
+        length = self.snake_length
+        for idx, (r, c) in enumerate(self.snake):
+            steps_until_free = length - idx
+            target[r, c] = steps_until_free / denom
+        return target
+
+    def _current_body_age_target(self) -> Optional[np.ndarray]:
+        if not self.body_age_target_obs:
+            return None
+        return self._body_age_map(self.body_age_target_min_fill)
+
+    def _get_observation_single_frame(self) -> np.ndarray:
+        """Single-frame observation before temporal stacking."""
         if self.head_centered:
             return self._get_observation_head_centered()
 
-        obs = np.zeros((self.n_channels, self.obs_n, self.obs_n), dtype=np.float32)
+        obs = np.zeros((self.single_frame_n_channels, self.obs_n, self.obs_n), dtype=np.float32)
 
         # Channel 0: Head
         hr, hc = self.snake_head
@@ -206,8 +354,48 @@ class SnakeEnv(gym.Env):
         obs[4, :, :] = self._walls
 
         # Channel 5: Flood-fill reachability from head
-        if self.flood_fill_obs:
-            obs[5, 1:-1, 1:-1] = self._flood_fill()
+        if self.flood_fill_obs and self.flood_fill_channel is not None:
+            obs[self.flood_fill_channel, 1:-1, 1:-1] = self._flood_fill()
+
+        if self.body_age_obs and self.body_age_obs_channel is not None:
+            body_age = self._body_age_map(self.body_age_obs_min_fill)
+            if body_age is not None:
+                obs[self.body_age_obs_channel, 1:-1, 1:-1] = body_age
+
+        if self.action_history_obs > 0:
+            action_offset = 5 + int(self.flood_fill_obs) + int(self.body_age_obs)
+            for hist_idx, rel_action in enumerate(self._action_history):
+                obs[action_offset + hist_idx * 3 + int(rel_action), :, :] = 1.0
+
+        if self.cycle_target_obs and self.cycle_target_channel is not None:
+            target = self._current_cycle_target()
+            if target is not None:
+                tr, tc = target
+                obs[self.cycle_target_channel, tr + 1, tc + 1] = 1.0
+
+        if self.tail_target_obs and self.tail_target_channel is not None:
+            target = self._current_tail_target()
+            if target is not None:
+                tr, tc = target
+                obs[self.tail_target_channel, tr + 1, tc + 1] = 1.0
+
+        if self.safe_action_target_obs and self.safe_action_target_channel is not None:
+            target = self._current_safe_action_target()
+            if target is not None:
+                tr, tc = target
+                if 0 <= tr < self.n and 0 <= tc < self.n:
+                    obs[self.safe_action_target_channel, tr + 1, tc + 1] = 1.0
+
+        if self.safe_action_soft_target_obs and self.safe_action_soft_target_channel is not None:
+            target = self._current_safe_action_soft_target()
+            if target is not None:
+                for action_idx in range(3):
+                    obs[self.safe_action_soft_target_channel + action_idx, :, :] = target[action_idx]
+
+        if self.body_age_target_obs and self.body_age_target_channel is not None:
+            target = self._current_body_age_target()
+            if target is not None:
+                obs[self.body_age_target_channel, 1:-1, 1:-1] = target
 
         # Rotate so snake always faces "up" (direction 0)
         if self.direction != 0:
@@ -216,8 +404,8 @@ class SnakeEnv(gym.Env):
         return obs
 
     def _get_observation_head_centered(self) -> np.ndarray:
-        """Head-centered observation: head always at grid center, 39x39 for n=20."""
-        obs = np.zeros((self.n_channels, self.obs_n, self.obs_n), dtype=np.float32)
+        """Single-frame head-centered observation."""
+        obs = np.zeros((self.single_frame_n_channels, self.obs_n, self.obs_n), dtype=np.float32)
         hr, hc = self.snake_head
         c = self.obs_n // 2  # center index (19 for 39x39)
 
@@ -243,7 +431,7 @@ class SnakeEnv(gym.Env):
                   ((col_board < 0) | (col_board >= self.n))[None, :]
 
         # Channel 5: Flood-fill reachability
-        if self.flood_fill_obs:
+        if self.flood_fill_obs and self.flood_fill_channel is not None:
             ff = self._flood_fill()
             # Compute overlap between grid and board
             gr_start = max(0, c - hr)
@@ -252,8 +440,58 @@ class SnakeEnv(gym.Env):
             bc_start = max(0, hc - c)
             h = min(self.n - br_start, self.obs_n - gr_start)
             w = min(self.n - bc_start, self.obs_n - gc_start)
-            obs[5, gr_start:gr_start+h, gc_start:gc_start+w] = \
+            obs[self.flood_fill_channel, gr_start:gr_start+h, gc_start:gc_start+w] = \
                 ff[br_start:br_start+h, bc_start:bc_start+w]
+
+        if self.body_age_obs and self.body_age_obs_channel is not None:
+            body_age = self._body_age_map(self.body_age_obs_min_fill)
+            if body_age is not None:
+                for r, col in self.snake:
+                    rr = r - hr + c
+                    cc = col - hc + c
+                    if 0 <= rr < self.obs_n and 0 <= cc < self.obs_n:
+                        obs[self.body_age_obs_channel, rr, cc] = body_age[r, col]
+
+        if self.action_history_obs > 0:
+            action_offset = 5 + int(self.flood_fill_obs) + int(self.body_age_obs)
+            for hist_idx, rel_action in enumerate(self._action_history):
+                obs[action_offset + hist_idx * 3 + int(rel_action), :, :] = 1.0
+
+        if self.cycle_target_obs and self.cycle_target_channel is not None:
+            target = self._current_cycle_target()
+            if target is not None:
+                tr, tc = target
+                obs[self.cycle_target_channel, tr - hr + c, tc - hc + c] = 1.0
+
+        if self.tail_target_obs and self.tail_target_channel is not None:
+            target = self._current_tail_target()
+            if target is not None:
+                tr, tc = target
+                obs[self.tail_target_channel, tr - hr + c, tc - hc + c] = 1.0
+
+        if self.safe_action_target_obs and self.safe_action_target_channel is not None:
+            target = self._current_safe_action_target()
+            if target is not None:
+                tr, tc = target
+                rr = tr - hr + c
+                cc = tc - hc + c
+                if 0 <= rr < self.obs_n and 0 <= cc < self.obs_n:
+                    obs[self.safe_action_target_channel, rr, cc] = 1.0
+
+        if self.safe_action_soft_target_obs and self.safe_action_soft_target_channel is not None:
+            target = self._current_safe_action_soft_target()
+            if target is not None:
+                for action_idx in range(3):
+                    obs[self.safe_action_soft_target_channel + action_idx, :, :] = target[action_idx]
+
+        if self.body_age_target_obs and self.body_age_target_channel is not None:
+            target = self._current_body_age_target()
+            if target is not None:
+                for r, col in self.snake:
+                    rr = r - hr + c
+                    cc = col - hc + c
+                    if 0 <= rr < self.obs_n and 0 <= cc < self.obs_n:
+                        obs[self.body_age_target_channel, rr, cc] = target[r, col]
 
         # Rotate so snake always faces "up"
         if self.direction != 0:
@@ -261,32 +499,118 @@ class SnakeEnv(gym.Env):
 
         return obs
 
-    def _build_hamiltonian_path(self) -> list:
-        """Build a zigzag Hamiltonian path covering the entire board."""
-        path = []
-        for r in range(self.n):
-            if r % 2 == 0:
-                for c in range(self.n):
-                    path.append((r, c))
+    def _history_zero(self) -> np.ndarray:
+        if self._history_zero_frame is None:
+            self._history_zero_frame = np.zeros(
+                (self.base_obs_channels, self.obs_n, self.obs_n),
+                dtype=np.float32,
+            )
+        return self._history_zero_frame
+
+    def _get_observation(self) -> np.ndarray:
+        """Observation with current-frame-first temporal stacking."""
+        single = self._get_observation_single_frame()
+        base = single[:self.base_obs_channels]
+        if self.aux_target_channels > 0:
+            aux = single[self.base_obs_channels:self.single_frame_n_channels]
+        else:
+            aux = None
+
+        if self.obs_history > 1:
+            history_frames = list(self._obs_history_frames)
+            while len(history_frames) < self.obs_history - 1:
+                history_frames.append(self._history_zero())
+            stacked_base = np.concatenate([base, *history_frames[: self.obs_history - 1]], axis=0)
+        else:
+            stacked_base = base
+
+        obs = stacked_base if aux is None else np.concatenate([stacked_base, aux], axis=0)
+        self._obs_history_frames.appendleft(base.copy())
+        return obs
+
+    def _build_hamiltonian_cycle(self) -> list[Tuple[int, int]]:
+        """Build a Hamiltonian cycle for even board sizes."""
+        if self.n % 2 != 0:
+            raise ValueError("Curriculum Hamiltonian cycle requires an even board size")
+
+        cycle = []
+
+        # Keep the first column as the return corridor so the walk closes into a cycle.
+        for c in range(self.n):
+            cycle.append((0, c))
+        for r in range(1, self.n):
+            if r % 2 == 1:
+                cols = range(self.n - 1, 0, -1)
             else:
-                for c in range(self.n - 1, -1, -1):
-                    path.append((r, c))
-        return path
+                cols = range(1, self.n)
+            for c in cols:
+                cycle.append((r, c))
+        for r in range(self.n - 1, 0, -1):
+            cycle.append((r, 0))
+        return cycle
+
+    def _transform_cycle(
+        self,
+        cycle: list[Tuple[int, int]],
+        *,
+        transpose: bool = False,
+        flip_rows: bool = False,
+        flip_cols: bool = False,
+    ) -> list[Tuple[int, int]]:
+        transformed = []
+        for r, c in cycle:
+            if transpose:
+                r, c = c, r
+            if flip_rows:
+                r = self.n - 1 - r
+            if flip_cols:
+                c = self.n - 1 - c
+            transformed.append((r, c))
+        return transformed
+
+    def _build_curriculum_cycles(self) -> list[list[Tuple[int, int]]]:
+        """Build a small family of Hamiltonian cycles for curriculum resets."""
+        base_cycle = self._build_hamiltonian_cycle()
+        variants = []
+        seen = set()
+        transforms = (
+            (False, False, False),
+            (False, False, True),
+            (False, True, False),
+            (False, True, True),
+            (True, False, False),
+            (True, False, True),
+            (True, True, False),
+            (True, True, True),
+        )
+        for transpose, flip_rows, flip_cols in transforms:
+            cycle = self._transform_cycle(
+                base_cycle,
+                transpose=transpose,
+                flip_rows=flip_rows,
+                flip_cols=flip_cols,
+            )
+            for candidate in (cycle, list(reversed(cycle))):
+                key = tuple(candidate)
+                if key not in seen:
+                    seen.add(key)
+                    variants.append(candidate)
+        return variants
 
     def _reset_with_fill(self) -> None:
-        """Curriculum reset: place snake along a zigzag path at random fill level."""
+        """Curriculum reset: place snake on a sampled Hamiltonian cycle segment."""
         board_area = self.n * self.n
         min_len = max(3, int(self.curriculum_min_fill * board_area))
         max_len = min(board_area - 1, int(self.curriculum_max_fill * board_area))
         target_len = int(self.rng.integers(min_len, max_len + 1))
 
-        # Build a zigzag path and pick a random starting offset
-        path = self._build_hamiltonian_path()
-        max_start = len(path) - target_len
-        start_idx = int(self.rng.integers(0, max(1, max_start + 1)))
+        cycle = self._curriculum_cycles[int(self.rng.integers(len(self._curriculum_cycles)))]
+        start_idx = int(self.rng.integers(0, len(cycle)))
 
-        # Snake: head is at start_idx, body follows along the path
-        self.snake = path[start_idx : start_idx + target_len]
+        # Snake: head is at start_idx, body follows forward along the cycle.
+        self.snake = [cycle[(start_idx + i) % len(cycle)] for i in range(target_len)]
+        self._curriculum_cycle = cycle
+        self._curriculum_head_idx = start_idx
 
         # Set direction based on head → first body segment
         hr, hc = self.snake[0]
@@ -312,6 +636,8 @@ class SnakeEnv(gym.Env):
         if self.curriculum_prob > 0 and self.rng.random() < self.curriculum_prob:
             self._reset_with_fill()
         else:
+            self._curriculum_cycle = None
+            self._curriculum_head_idx = None
             center = self.n // 2
             self.direction = int(self.rng.integers(4))
             dr, dc = self.DIRECTIONS[self.direction]
@@ -329,6 +655,8 @@ class SnakeEnv(gym.Env):
         self.score = max(0, self.snake_length - 3)
         self.total_steps = 0
         self.prev_phi = self._compute_phi()
+        self._obs_history_frames.clear()
+        self._action_history.clear()
 
         obs = self._get_observation()
         info = {
@@ -354,7 +682,39 @@ class SnakeEnv(gym.Env):
         terminated = False
         truncated = False
         base_reward = 0.0
+        follow_bonus = 0.0
+        safe_action_bonus = 0.0
         reason = None
+        followed_cycle = False
+
+        if self._curriculum_cycle is not None and self._curriculum_head_idx is not None:
+            next_idx = (self._curriculum_head_idx - 1) % len(self._curriculum_cycle)
+            expected_head = self._curriculum_cycle[next_idx]
+            if new_head == expected_head:
+                followed_cycle = True
+                if (
+                    self.curriculum_follow_bonus != 0.0
+                    and self.snake_length / float(self.n * self.n) >= self.curriculum_follow_min_fill
+                ):
+                    follow_bonus = self.curriculum_follow_bonus
+            else:
+                if (
+                    self.curriculum_follow_bonus != 0.0
+                    and self.snake_length / float(self.n * self.n) >= self.curriculum_follow_min_fill
+                ):
+                    follow_bonus = -self.curriculum_follow_bonus
+                self._curriculum_cycle = None
+                self._curriculum_head_idx = None
+
+        if (
+            self.safe_action_bonus != 0.0
+            and self.snake_length / float(self.n * self.n) >= self.safe_action_bonus_min_fill
+        ):
+            safe_scores = self.score_relative_actions(fill_weight=self.safe_action_bonus_fill_weight)
+            best_score = max(safe_scores)
+            if np.isfinite(best_score) and np.isfinite(safe_scores[int(action)]):
+                if safe_scores[int(action)] >= best_score - 1e-6:
+                    safe_action_bonus = self.safe_action_bonus
 
         # Check wall collision
         if not (0 <= new_head[0] < self.n and 0 <= new_head[1] < self.n):
@@ -391,6 +751,9 @@ class SnakeEnv(gym.Env):
                 self.snake.pop()
                 self.steps_since_food += 1
 
+            if followed_cycle and self._curriculum_head_idx is not None:
+                self._curriculum_head_idx = (self._curriculum_head_idx - 1) % len(self._curriculum_cycle)
+
         if not terminated and self.steps_since_food > self.max_no_food:
             if self.stall_terminates:
                 terminated = True  # Proper termination - PPO won't bootstrap
@@ -409,8 +772,10 @@ class SnakeEnv(gym.Env):
         if terminated and reason != "win":
             reward = base_reward
         else:
-            reward = base_reward + r_shape + self.survival_bonus
+            reward = base_reward + r_shape + self.survival_bonus + follow_bonus + safe_action_bonus
 
+        if self.action_history_obs > 0:
+            self._action_history.appendleft(int(action))
         obs = self._get_observation()
         info = {
             "length": self.snake_length,
@@ -420,6 +785,86 @@ class SnakeEnv(gym.Env):
             "food_pos": self.food_pos,
         }
         return obs, reward, terminated, truncated, info
+
+    def _snapshot_state(self) -> tuple:
+        return (
+            list(self.snake),
+            self.direction,
+            self.food_pos,
+            self.steps_since_food,
+            self.score,
+            self.prev_phi,
+            self.total_steps,
+            self._curriculum_cycle,
+            self._curriculum_head_idx,
+            [frame.copy() for frame in self._obs_history_frames],
+            list(self._action_history),
+        )
+
+    def _restore_state(self, snapshot: tuple) -> None:
+        (
+            snake,
+            direction,
+            food_pos,
+            steps_since_food,
+            score,
+            prev_phi,
+            total_steps,
+            curriculum_cycle,
+            curriculum_head_idx,
+            obs_history_frames,
+            action_history,
+        ) = snapshot
+        self.snake = list(snake)
+        self.direction = direction
+        self.food_pos = food_pos
+        self.steps_since_food = steps_since_food
+        self.score = score
+        self.prev_phi = prev_phi
+        self.total_steps = total_steps
+        self._curriculum_cycle = curriculum_cycle
+        self._curriculum_head_idx = curriculum_head_idx
+        self._obs_history_frames.clear()
+        for frame in obs_history_frames:
+            self._obs_history_frames.append(frame.copy())
+        self._action_history.clear()
+        for action in action_history:
+            self._action_history.append(int(action))
+
+    def score_relative_actions(self, fill_weight: float = 500.0) -> list[float]:
+        """Score relative actions with a one-step lookahead heuristic.
+
+        Scores are ordered for relative actions [left, straight, right].
+        Immediate wins score +inf, immediate deaths score -inf. Surviving
+        actions are ranked by reachable-space after the move plus a small
+        preference for higher fill, which nudges the heuristic toward food
+        collection without ignoring maneuverability.
+        """
+        scores = []
+        snapshot = self._snapshot_state()
+        board_area = float(self.n * self.n)
+        safe_action_target_obs = self.safe_action_target_obs
+        safe_action_soft_target_obs = self.safe_action_soft_target_obs
+        safe_action_bonus = self.safe_action_bonus
+        self.safe_action_target_obs = False
+        self.safe_action_soft_target_obs = False
+        self.safe_action_bonus = 0.0
+        for action in range(3):
+            _, _, terminated, truncated, info = self.step(action)
+            if terminated or truncated:
+                if info.get("reason") == "win":
+                    heuristic = float("inf")
+                else:
+                    heuristic = float("-inf")
+            else:
+                reachable = float(np.sum(self._flood_fill()))
+                heuristic = reachable + fill_weight * (self.snake_length / board_area)
+            scores.append(heuristic)
+            self._restore_state(snapshot)
+        self.safe_action_target_obs = safe_action_target_obs
+        self.safe_action_soft_target_obs = safe_action_soft_target_obs
+        self.safe_action_bonus = safe_action_bonus
+        return scores
 
     def render(self) -> Optional[np.ndarray]:
         if self.render_mode == "human":

@@ -106,6 +106,10 @@ class ExperimentTracker:
         self.index_path = os.path.join(self.data_dir, "index.jsonl")
 
         self.best_eval: Optional[Dict[str, Any]] = None
+        self.best_eval_checkpoint: Optional[Dict[str, Any]] = None
+        self.first_train_win: Optional[Dict[str, Any]] = None
+        self.first_train_win_checkpoint: Optional[Dict[str, Any]] = None
+        self.latest_train_win_checkpoint: Optional[Dict[str, Any]] = None
         self.last_eval: Optional[Dict[str, Any]] = None
         self.last_train: Optional[Dict[str, Any]] = None
         self.checkpoints: list[Dict[str, Any]] = []
@@ -171,8 +175,11 @@ class ExperimentTracker:
         agent_steps: int,
         epoch: int,
         deterministic: bool,
-    ) -> None:
+    ) -> bool:
+        improved = False
+
         def _log() -> None:
+            nonlocal improved
             record = {
                 "type": "eval",
                 "time": _utc_now(),
@@ -185,6 +192,81 @@ class ExperimentTracker:
             self.last_eval = record
             if _is_better_eval(record, self.best_eval):
                 self.best_eval = record
+                improved = True
+
+        self._safe(_log)
+        return improved
+
+    def log_best_eval_checkpoint(self, path: str, *, epoch: int, agent_steps: int) -> None:
+        def _log() -> None:
+            record = {
+                "type": "best_eval_checkpoint",
+                "time": _utc_now(),
+                "path": path,
+                "epoch": int(epoch),
+                "agent_steps": int(agent_steps),
+            }
+            _append_jsonl(self.metrics_path, record)
+            self.best_eval_checkpoint = record
+
+        self._safe(_log)
+
+    def log_train_win(
+        self,
+        logs: Dict[str, Any],
+        *,
+        agent_steps: int,
+        epoch: int,
+    ) -> bool:
+        captured = False
+
+        def _log() -> None:
+            nonlocal captured
+            record = {
+                "type": "train_win",
+                "time": _utc_now(),
+                "agent_steps": int(agent_steps),
+                "epoch": int(epoch),
+                **logs,
+            }
+            _append_jsonl(self.metrics_path, record)
+            if self.first_train_win is None:
+                self.first_train_win = record
+                captured = True
+
+        self._safe(_log)
+        return captured
+
+    def log_train_win_checkpoint(
+        self,
+        path: str,
+        *,
+        epoch: int,
+        agent_steps: int,
+        kind: str,
+        score: Optional[float] = None,
+        episode_length: Optional[float] = None,
+        win_rate: Optional[float] = None,
+    ) -> None:
+        def _log() -> None:
+            record = {
+                "type": "train_win_checkpoint",
+                "time": _utc_now(),
+                "path": path,
+                "epoch": int(epoch),
+                "agent_steps": int(agent_steps),
+                "kind": kind,
+            }
+            if score is not None:
+                record["score"] = float(score)
+            if episode_length is not None:
+                record["episode_length"] = float(episode_length)
+            if win_rate is not None:
+                record["win_rate"] = float(win_rate)
+            _append_jsonl(self.metrics_path, record)
+            if kind == "first":
+                self.first_train_win_checkpoint = record
+            self.latest_train_win_checkpoint = record
 
         self._safe(_log)
 
@@ -228,6 +310,10 @@ class ExperimentTracker:
                 "last_train": self.last_train,
                 "last_eval": self.last_eval,
                 "best_eval": self.best_eval,
+                "best_eval_checkpoint": self.best_eval_checkpoint,
+                "first_train_win": self.first_train_win,
+                "first_train_win_checkpoint": self.first_train_win_checkpoint,
+                "latest_train_win_checkpoint": self.latest_train_win_checkpoint,
                 "checkpoints": self.checkpoints,
                 "final_checkpoint": final_checkpoint,
             }
@@ -240,6 +326,10 @@ class ExperimentTracker:
                 "run_dir": self.run_dir,
                 "status": status,
                 "best_eval": self.best_eval,
+                "best_eval_checkpoint": self.best_eval_checkpoint,
+                "first_train_win": self.first_train_win,
+                "first_train_win_checkpoint": self.first_train_win_checkpoint,
+                "latest_train_win_checkpoint": self.latest_train_win_checkpoint,
                 "last_eval": self.last_eval,
                 "final_checkpoint": final_checkpoint,
             }
