@@ -59,6 +59,7 @@ def summarize(results: list[dict[str, Any]], *, board_size: int, checkpoint: str
     lengths = [int(result["length"]) for result in results]
     reasons = [str(result["reason"]) for result in results]
     wins = sum(int(score >= perfect_score) for score in scores)
+    win_steps = [int(result["steps"]) for result in results if result["win"] and result.get("steps") is not None]
     summary = {
         "episodes": len(results),
         "wins": wins,
@@ -70,6 +71,12 @@ def summarize(results: list[dict[str, Any]], *, board_size: int, checkpoint: str
         "std_score": float(np.std(scores)) if scores else 0.0,
         "failures": [result for result in results if not result["win"]],
         "checkpoint": checkpoint,
+        "mean_win_steps": float(np.mean(win_steps)) if win_steps else None,
+        "median_win_steps": float(np.median(win_steps)) if win_steps else None,
+        "p95_win_steps": float(np.percentile(win_steps, 95)) if win_steps else None,
+        "min_win_steps": int(min(win_steps)) if win_steps else None,
+        "max_win_steps": int(max(win_steps)) if win_steps else None,
+        "steps_per_food": float(np.mean(win_steps) / perfect_score) if win_steps else None,
     }
     summary.update(
         summarize_phase_metrics(

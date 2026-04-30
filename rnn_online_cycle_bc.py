@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from distill.evaluate_rnn import evaluate_policy
 from distill.expert import expert_action, find_aligned_cycle
 from distill.rnn_model import SnakeRNNPolicy, load_rnn_policy_state
+from rnn_cycle_shortcut_patch import _teacher_action
 from snake_env import SnakeEnv
 
 
@@ -65,15 +66,18 @@ def _make_env(*, board_size: int, flood_fill: bool, head_centered: bool, seed: i
 def _train_chunk(
     *,
     policy: SnakeRNNPolicy,
+    anchor_policy: SnakeRNNPolicy | None,
     optimizer: torch.optim.Optimizer,
     observations: list[np.ndarray],
     actions: list[int],
     prev_actions: list[int],
     fill_values: list[float],
     hidden: torch.Tensor,
+    anchor_hidden: torch.Tensor | None,
     device: str,
     grad_clip: float,
-) -> tuple[torch.Tensor, dict[str, float]]:
+    kl_anchor_coef: float,
+) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, float]]:
     obs_t = torch.as_tensor(np.stack(observations), dtype=torch.float32, device=device).unsqueeze(1)
     act_t = torch.as_tensor(actions, dtype=torch.long, device=device).unsqueeze(1)
     prev_t = None
@@ -90,6 +94,22 @@ def _train_chunk(
         fill_values=fill_t,
     )
     loss = F.cross_entropy(logits.reshape(-1, 3), act_t.reshape(-1))
+    kl_loss = None
+    next_anchor_hidden = anchor_hidden
+    if anchor_policy is not None and anchor_hidden is not None and kl_anchor_coef > 0.0:
+        with torch.no_grad():
+            anchor_logits, next_anchor_hidden = anchor_policy.forward_sequence(
+                obs_t,
+                hidden=anchor_hidden,
+                prev_actions=prev_t,
+                fill_values=fill_t,
+            )
+        kl_loss = F.kl_div(
+            F.log_softmax(logits, dim=-1),
+            F.softmax(anchor_logits, dim=-1),
+            reduction="none",
+        ).sum(dim=-1).mean()
+        loss = loss + kl_anchor_coef * kl_loss
     pred = torch.argmax(logits, dim=-1)
     accuracy = (pred == act_t).float().mean()
 
@@ -99,8 +119,9 @@ def _train_chunk(
         torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
     optimizer.step()
 
-    return next_hidden.detach(), {
+    return next_hidden.detach(), None if next_anchor_hidden is None else next_anchor_hidden.detach(), {
         "loss": float(loss.item()),
+        "kl_loss": None if kl_loss is None else float(kl_loss.item()),
         "accuracy": float(accuracy.item()),
     }
 
@@ -159,6 +180,7 @@ def _maybe_eval(
 def train_episode(
     *,
     policy: SnakeRNNPolicy,
+    anchor_policy: SnakeRNNPolicy | None,
     optimizer: torch.optim.Optimizer,
     board_size: int,
     flood_fill: bool,
@@ -168,6 +190,10 @@ def train_episode(
     seq_len: int,
     max_steps: int,
     grad_clip: float,
+    teacher_mode: str,
+    max_plan_nodes: int,
+    max_plan_candidates: int,
+    kl_anchor_coef: float,
 ) -> dict[str, Any]:
     env = _make_env(
         board_size=board_size,
@@ -178,7 +204,9 @@ def train_episode(
     obs, _ = env.reset(seed=seed)
     initial_direction = int(env.direction)
     cycle, head_idx = find_aligned_cycle(env)
+    cycle_index = {pos: idx for idx, pos in enumerate(cycle)}
     hidden = policy.initial_state(1, device)
+    anchor_hidden = None if anchor_policy is None else anchor_policy.initial_state(1, device)
     prev_action = START_ACTION_TOKEN
 
     obs_buf: list[np.ndarray] = []
@@ -186,6 +214,7 @@ def train_episode(
     prev_buf: list[int] = []
     fill_buf: list[float] = []
     chunk_losses: list[float] = []
+    chunk_kls: list[float] = []
     chunk_accs: list[float] = []
     chunks = 0
     done = False
@@ -193,7 +222,18 @@ def train_episode(
     steps = 0
 
     while not done and steps < max_steps:
-        action, next_head_idx = expert_action(env, cycle, head_idx)
+        if teacher_mode == "hamiltonian":
+            action, next_head_idx = expert_action(env, cycle, head_idx)
+        else:
+            action = _teacher_action(
+                env,
+                cycle,
+                cycle_index,
+                teacher_mode,
+                max_plan_nodes=max_plan_nodes,
+                max_plan_candidates=max_plan_candidates,
+            )
+            next_head_idx = cycle_index.get(_target_head_after_action(env, action), head_idx)
         obs_buf.append(obs.astype(np.float32, copy=True))
         act_buf.append(int(action))
         prev_buf.append(int(prev_action))
@@ -206,18 +246,23 @@ def train_episode(
         steps += 1
 
         if len(obs_buf) >= seq_len or done:
-            hidden, metrics = _train_chunk(
+            hidden, anchor_hidden, metrics = _train_chunk(
                 policy=policy,
+                anchor_policy=anchor_policy,
                 optimizer=optimizer,
                 observations=obs_buf,
                 actions=act_buf,
                 prev_actions=prev_buf,
                 fill_values=fill_buf,
                 hidden=hidden,
+                anchor_hidden=anchor_hidden,
                 device=device,
                 grad_clip=grad_clip,
+                kl_anchor_coef=kl_anchor_coef,
             )
             chunk_losses.append(metrics["loss"])
+            if metrics["kl_loss"] is not None:
+                chunk_kls.append(metrics["kl_loss"])
             chunk_accs.append(metrics["accuracy"])
             chunks += 1
             obs_buf = []
@@ -235,8 +280,16 @@ def train_episode(
         "teacher_steps": steps,
         "chunks": chunks,
         "mean_loss": float(np.mean(chunk_losses)) if chunk_losses else 0.0,
+        "mean_kl_loss": float(np.mean(chunk_kls)) if chunk_kls else None,
         "mean_accuracy": float(np.mean(chunk_accs)) if chunk_accs else 0.0,
     }
+
+
+def _target_head_after_action(env: SnakeEnv, action: int) -> tuple[int, int]:
+    new_dir = (env.direction + {0: -1, 1: 0, 2: 1}[int(action)]) % 4
+    dr, dc = env.DIRECTIONS[new_dir]
+    hr, hc = env.snake_head
+    return hr + dr, hc + dc
 
 
 def main() -> int:
@@ -253,6 +306,10 @@ def main() -> int:
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--prev-action-input", action="store_true")
     parser.add_argument("--fill-input", action="store_true")
+    parser.add_argument("--teacher-mode", choices=["hamiltonian", "cycle", "grid_path"], default="hamiltonian")
+    parser.add_argument("--max-plan-nodes", type=int, default=2000)
+    parser.add_argument("--max-plan-candidates", type=int, default=64)
+    parser.add_argument("--kl-anchor-coef", type=float, default=0.0)
     parser.add_argument(
         "--train-policy-head-only",
         action="store_true",
@@ -341,6 +398,23 @@ def main() -> int:
     if args.resume is not None:
         state = torch.load(args.resume, map_location="cpu")
         load_rnn_policy_state(policy, state)
+    anchor_policy = None
+    if args.kl_anchor_coef > 0.0:
+        if args.resume is None:
+            raise SystemExit("--kl-anchor-coef requires --resume")
+        anchor_policy = SnakeRNNPolicy(
+            board_size=args.board_size,
+            n_channels=probe_env.observation_space.shape[0],
+            flood_fill=args.flood_fill,
+            head_centered=args.head_centered,
+            hidden_size=args.hidden_size,
+            prev_action_input=args.prev_action_input,
+            fill_input=args.fill_input,
+        ).to(args.device)
+        load_rnn_policy_state(anchor_policy, torch.load(args.resume, map_location="cpu"))
+        anchor_policy.eval()
+        for param in anchor_policy.parameters():
+            param.requires_grad = False
     if args.train_policy_head_only:
         for name, param in policy.named_parameters():
             param.requires_grad = name.startswith("policy_head")
@@ -377,6 +451,7 @@ def main() -> int:
             seed_cursor = train_seed + 1
         event = train_episode(
             policy=policy,
+            anchor_policy=anchor_policy,
             optimizer=optimizer,
             board_size=args.board_size,
             flood_fill=args.flood_fill,
@@ -386,6 +461,10 @@ def main() -> int:
             seq_len=args.seq_len,
             max_steps=args.max_steps,
             grad_clip=args.grad_clip,
+            teacher_mode=args.teacher_mode,
+            max_plan_nodes=max(1, args.max_plan_nodes),
+            max_plan_candidates=max(1, args.max_plan_candidates),
+            kl_anchor_coef=max(0.0, args.kl_anchor_coef),
         )
         event["episode"] = ep_idx
         event["elapsed_sec"] = round(time.time() - started, 1)
@@ -400,6 +479,7 @@ def main() -> int:
                 "teacher_steps": event["teacher_steps"],
                 "chunks": event["chunks"],
                 "mean_loss": round(event["mean_loss"], 6),
+                "mean_kl_loss": None if event["mean_kl_loss"] is None else round(event["mean_kl_loss"], 6),
                 "mean_accuracy": round(event["mean_accuracy"], 4),
                 "elapsed_sec": event["elapsed_sec"],
             },

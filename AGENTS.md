@@ -2,14 +2,17 @@
 
 ## Project Overview
 
-**Perfect Snake** is a reinforcement learning project training AI agents to achieve perfect play on the classic Snake game. The goal is 100% win rate on a 20x20 grid with a perfect score of 397 (snake fills entire board).
+**Perfect Snake** is a reinforcement learning project training AI agents to achieve perfect play on the classic Snake game. The first goal is 100% win rate on a 20x20 grid with a perfect score of 397 (snake fills entire board). The refined goal is a pure neural policy that wins reliably while using fewer steps.
 
-**Current status:** 10x10 solved (100% win rate). 20x20 plateaus at ~40% (score ~155/397). Active experimentation ongoing.
+**Current status:** 10x10 solved (100% win rate). 20x20 is solved for the win-rate objective: a pure RNN policy has achieved 100/100 deterministic wins on the benchmark seed slice. The winning policy uses a conservative cycle-like strategy that is path-inefficient, so the active frontier is now preserving win reliability while reducing steps-to-win.
 
 ## Mission
 
 - Train a **pure neural network** policy that achieves **100% deterministic win rate** on 20x20 Snake.
 - Success means a **saved checkpoint** that scores **397/397** reliably in greedy play, not just occasional perfect training rollouts or stochastic samples.
+- Refined success means the policy is also **path efficient**: among checkpoints that pass the win-rate gate, rank candidates by lower mean and tail steps-to-win on fixed deterministic seed suites.
+- Treat win rate as a hard constraint. Do not accept fewer steps if the candidate introduces failures on the benchmark suite.
+- Report `win_rate`, `mean_win_steps`, `p95_win_steps`, and `steps_per_food` for every serious RNN checkpoint comparison.
 - Prioritize experiments that improve **stability, reproducibility, and branchability**, not just peak lucky-seed scores.
 - Use the project as a scientific loop: form hypotheses, run controlled experiments, measure failure modes, and distinguish between **compute bottlenecks**, **optimization instability**, and **true dead ends**.
 
