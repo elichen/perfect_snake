@@ -34,6 +34,7 @@ def evaluate_policy(
     scores: list[int] = []
     lengths: list[int] = []
     reasons: list[str] = []
+    steps: list[int] = []
 
     eval_seeds = seeds if seeds is not None else [seed + ep for ep in range(episodes)]
     for ep_seed in eval_seeds:
@@ -62,7 +63,7 @@ def evaluate_policy(
             if use_prev_action_input:
                 prev_t = torch.as_tensor([prev_action], dtype=torch.long, device=device)
             fill_t = None
-            if use_fill_input:
+            if use_fill_input or getattr(policy, "early_head_max_fill", None) is not None:
                 fill_ratio = env.snake_length / float(board_size * board_size)
                 fill_t = torch.as_tensor([fill_ratio], dtype=torch.float32, device=device)
             logits, hidden = policy.forward_step(
@@ -86,8 +87,10 @@ def evaluate_policy(
         scores.append(score)
         lengths.append(length)
         reasons.append(reason)
+        steps.append(int(info.get("steps", 0)))
 
     wins = sum(int(score >= perfect_score) for score in scores)
+    win_steps = [step for score, step in zip(scores, steps) if score >= perfect_score]
     stats = {
         "episodes": len(eval_seeds),
         "seeds": eval_seeds,
@@ -100,6 +103,10 @@ def evaluate_policy(
         "max_score": int(max(scores)) if scores else 0,
         "mean_length": float(np.mean(lengths)) if lengths else 0.0,
         "std_score": float(np.std(scores)) if scores else 0.0,
+        "mean_win_steps": float(np.mean(win_steps)) if win_steps else None,
+        "median_win_steps": float(np.median(win_steps)) if win_steps else None,
+        "p95_win_steps": float(np.percentile(win_steps, 95)) if win_steps else None,
+        "steps_per_food": float(np.mean(win_steps) / perfect_score) if win_steps else None,
     }
     stats.update(
         summarize_phase_metrics(
@@ -131,6 +138,7 @@ def evaluate_checkpoint(
     use_fill_input: bool = False,
     future_action_horizon: int = 0,
     early_head_max_fill: float | None = None,
+    residual_policy_head: bool = False,
 ) -> dict:
     base_channels = 5 + int(flood_fill)
     n_channels = base_channels
@@ -154,6 +162,7 @@ def evaluate_checkpoint(
         fill_input=use_fill_input,
         future_action_horizon=future_action_horizon,
         early_head_max_fill=early_head_max_fill,
+        residual_policy_head=residual_policy_head,
     ).to(device)
     state_dict = torch.load(checkpoint_path, map_location=device)
     load_rnn_policy_state(policy, state_dict)
@@ -199,6 +208,7 @@ def main() -> None:
     parser.add_argument("--fill-input", action="store_true")
     parser.add_argument("--future-action-horizon", type=int, default=0)
     parser.add_argument("--early-head-max-fill", type=float, default=None)
+    parser.add_argument("--residual-policy-head", action="store_true")
     args = parser.parse_args()
     seed_list = None
     if args.seeds:
@@ -222,6 +232,7 @@ def main() -> None:
         use_fill_input=args.fill_input,
         future_action_horizon=args.future_action_horizon,
         early_head_max_fill=args.early_head_max_fill,
+        residual_policy_head=args.residual_policy_head,
     )
     print(stats)
 

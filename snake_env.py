@@ -13,6 +13,7 @@ Actions: 0=turn left, 1=straight, 2=turn right (relative)
 
 from __future__ import annotations
 
+import copy
 from collections import deque
 from typing import Any, Deque, Dict, Optional, Tuple
 
@@ -799,6 +800,7 @@ class SnakeEnv(gym.Env):
             self._curriculum_head_idx,
             [frame.copy() for frame in self._obs_history_frames],
             list(self._action_history),
+            copy.deepcopy(self.rng.bit_generator.state),
         )
 
     def _restore_state(self, snapshot: tuple) -> None:
@@ -814,6 +816,7 @@ class SnakeEnv(gym.Env):
             curriculum_head_idx,
             obs_history_frames,
             action_history,
+            rng_state,
         ) = snapshot
         self.snake = list(snake)
         self.direction = direction
@@ -830,6 +833,7 @@ class SnakeEnv(gym.Env):
         self._action_history.clear()
         for action in action_history:
             self._action_history.append(int(action))
+        self.rng.bit_generator.state = copy.deepcopy(rng_state)
 
     def score_relative_actions(self, fill_weight: float = 500.0) -> list[float]:
         """Score relative actions with a one-step lookahead heuristic.

@@ -155,6 +155,8 @@ def main() -> int:
                     train_seed = args.train_seeds[ep_idx % len(args.train_seeds)]
                     event = train_episode(
                         policy=policy,
+                        anchor_policy=None,
+                        rollout_policy=None,
                         optimizer=optimizer,
                         board_size=args.board_size,
                         flood_fill=False,
@@ -164,6 +166,14 @@ def main() -> int:
                         seq_len=args.seq_len,
                         max_steps=args.max_steps,
                         grad_clip=args.grad_clip,
+                        teacher_mode="hamiltonian",
+                        max_plan_nodes=1,
+                        max_plan_candidates=1,
+                        kl_anchor_coef=0.0,
+                        shortcut_score_max=-1,
+                        teacher_rollout_policy="teacher",
+                        correction_weight=1.0,
+                        teacher_weight=1.0,
                     )
                     train_events.append(event)
 

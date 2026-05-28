@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from distill.expert import find_aligned_cycle, relative_action_toward
+from distill.expert import find_aligned_cycle
 from distill.rnn_model import SnakeRNNPolicy, load_rnn_policy_state
 from rnn_eval_seeds import eval_seed
 from snake_env import SnakeEnv
@@ -208,6 +208,70 @@ def _path_preserves_cycle_order(
     return valid
 
 
+def _head_can_reach_tail(env: SnakeEnv) -> bool:
+    tail = env.snake[-1]
+    blocked = set(env.snake[:-1])
+    blocked.discard(env.snake_head)
+    queue = deque([env.snake_head])
+    seen = {env.snake_head}
+    while queue:
+        pos = queue.popleft()
+        if pos == tail:
+            return True
+        for dr, dc in env.DIRECTIONS.values():
+            next_pos = (pos[0] + dr, pos[1] + dc)
+            if not (0 <= next_pos[0] < env.n and 0 <= next_pos[1] < env.n):
+                continue
+            if next_pos in blocked or next_pos in seen:
+                continue
+            seen.add(next_pos)
+            queue.append(next_pos)
+    return False
+
+
+def _path_reaches_food_with_tail_escape(env: SnakeEnv, path: list[int]) -> bool:
+    snapshot = env._snapshot_state()
+    score_before = int(env.score)
+    valid = False
+    for action in path:
+        _, _, terminated, truncated, info = env.step(action)
+        if terminated or truncated:
+            valid = info.get("reason") == "win"
+            break
+        if int(env.score) > score_before:
+            valid = _head_can_reach_tail(env)
+            break
+    env._restore_state(snapshot)
+    return valid
+
+
+def _safe_fallback_action(env: SnakeEnv, cycle_index: dict[tuple[int, int], int]) -> int:
+    first_nonterminal: int | None = None
+    first_tail_reachable: int | None = None
+    snapshot = env._snapshot_state()
+    for action in range(3):
+        _, _, terminated, truncated, info = env.step(action)
+        if terminated or truncated:
+            if info.get("reason") == "win":
+                env._restore_state(snapshot)
+                return action
+            env._restore_state(snapshot)
+            continue
+        if first_nonterminal is None:
+            first_nonterminal = action
+        if first_tail_reachable is None and _head_can_reach_tail(env):
+            first_tail_reachable = action
+        if _cycle_ordered(env, cycle_index):
+            env._restore_state(snapshot)
+            return action
+        env._restore_state(snapshot)
+    if first_tail_reachable is not None:
+        return first_tail_reachable
+    if first_nonterminal is not None:
+        return first_nonterminal
+    return 1
+
+
 def _cycle_shortcut_teacher_action(
     env: SnakeEnv,
     cycle: list[tuple[int, int]],
@@ -217,7 +281,7 @@ def _cycle_shortcut_teacher_action(
     n_cycle = len(cycle)
     head_idx = cycle_index[env.snake_head]
     food_idx = cycle_index[env.food_pos]
-    fallback = relative_action_toward(env, cycle[(head_idx - 1) % n_cycle])
+    fallback = _safe_fallback_action(env, cycle_index)
     best: tuple[float, int] | None = None
     snapshot = env._snapshot_state()
     score_before = int(env.score)
@@ -277,7 +341,7 @@ def _grid_shortest_teacher_action(
                 0 if action == fallback else 1,
             ),
         )
-    return relative_action_toward(env, cycle[(head_idx - 1) % n_cycle])
+    return _safe_fallback_action(env, cycle_index)
 
 
 def _grid_path_teacher_action(
@@ -297,6 +361,23 @@ def _grid_path_teacher_action(
     return _cycle_shortcut_teacher_action(env, cycle, cycle_index)
 
 
+def _tail_path_teacher_action(
+    env: SnakeEnv,
+    cycle: list[tuple[int, int]],
+    cycle_index: dict[tuple[int, int], int],
+    max_plan_nodes: int,
+    max_plan_candidates: int,
+) -> int:
+    for path in _static_path_candidates(
+        env,
+        max_nodes=max_plan_nodes,
+        max_candidates=max_plan_candidates,
+    ):
+        if path and _path_reaches_food_with_tail_escape(env, path):
+            return int(path[0])
+    return _cycle_shortcut_teacher_action(env, cycle, cycle_index)
+
+
 def _teacher_action(
     env: SnakeEnv,
     cycle: list[tuple[int, int]],
@@ -304,9 +385,20 @@ def _teacher_action(
     teacher_mode: str,
     max_plan_nodes: int,
     max_plan_candidates: int,
+    shortcut_score_max: int,
 ) -> int:
     if teacher_mode == "grid_path":
         return _grid_path_teacher_action(
+            env,
+            cycle,
+            cycle_index,
+            max_plan_nodes=max_plan_nodes,
+            max_plan_candidates=max_plan_candidates,
+        )
+    if teacher_mode == "tail_path":
+        if shortcut_score_max >= 0 and int(env.score) > shortcut_score_max:
+            return _cycle_shortcut_teacher_action(env, cycle, cycle_index)
+        return _tail_path_teacher_action(
             env,
             cycle,
             cycle_index,
@@ -335,6 +427,8 @@ def _collect_teacher_seed(
     teacher_mode: str,
     max_plan_nodes: int,
     max_plan_candidates: int,
+    shortcut_score_max: int,
+    teacher_rollout_policy: str,
 ) -> dict[str, Any]:
     env = SnakeEnv(n=board_size, gamma=0.999, alpha=0.2, seed=seed)
     obs, _ = env.reset(seed=seed)
@@ -363,6 +457,7 @@ def _collect_teacher_seed(
             teacher_mode,
             max_plan_nodes=max_plan_nodes,
             max_plan_candidates=max_plan_candidates,
+            shortcut_score_max=shortcut_score_max,
         )
         is_correction = teacher_action != base_action
 
@@ -375,7 +470,8 @@ def _collect_teacher_seed(
             corrections += int(is_correction)
             samples += 1
 
-        obs, _, terminated, truncated, info = env.step(teacher_action)
+        rollout_action = base_action if teacher_rollout_policy == "base" else teacher_action
+        obs, _, terminated, truncated, info = env.step(rollout_action)
         if terminated or truncated:
             break
 
@@ -392,6 +488,7 @@ def _collect_teacher_seed(
         "teacher_reason": info.get("reason"),
         "teacher_steps": int(info.get("steps", env.total_steps)),
         "teacher_mode": teacher_mode,
+        "teacher_rollout_policy": teacher_rollout_policy,
     }
 
 
@@ -474,6 +571,8 @@ def _collect_dataset(
     teacher_mode: str,
     max_plan_nodes: int,
     max_plan_candidates: int,
+    shortcut_score_max: int,
+    teacher_rollout_policy: str,
 ) -> dict[str, Any]:
     dataset: dict[str, list[Any]] = {
         "features": [],
@@ -497,6 +596,8 @@ def _collect_dataset(
             teacher_mode=teacher_mode,
             max_plan_nodes=max_plan_nodes,
             max_plan_candidates=max_plan_candidates,
+            shortcut_score_max=shortcut_score_max,
+            teacher_rollout_policy=teacher_rollout_policy,
         )
         _pop_samples(record, dataset)
         record["role"] = "teacher"
@@ -539,15 +640,22 @@ def _train_head(
     epochs: int,
     batch_size: int,
     device: str,
+    head_name: str = "policy_head",
 ) -> dict[str, Any]:
+    if head_name not in {"policy_head", "residual_policy_head"}:
+        raise ValueError(f"unsupported head_name={head_name}")
+    if not hasattr(policy, head_name):
+        raise ValueError(f"policy has no {head_name}")
     for name, param in policy.named_parameters():
-        param.requires_grad = name.startswith("policy_head")
+        param.requires_grad = name.startswith(head_name)
     optimizer = torch.optim.Adam([param for param in policy.parameters() if param.requires_grad], lr=lr)
     features = dataset["features"].to(device)
     labels = dataset["labels"].to(device)
     weights = dataset["weights"].to(device)
-    base_probs = F.softmax(dataset["base_logits"].to(device), dim=-1)
+    base_logits = dataset["base_logits"].to(device)
+    base_probs = F.softmax(base_logits, dim=-1)
     kl_weights = dataset["kl_weights"].to(device)
+    head = getattr(policy, head_name)
     n_samples = int(labels.shape[0])
     losses = []
     ce_losses = []
@@ -558,7 +666,9 @@ def _train_head(
         order = torch.randperm(n_samples, device=device)
         for start in range(0, n_samples, batch_size):
             index = order[start : start + batch_size]
-            logits = policy.policy_head(features[index])
+            logits = head(features[index])
+            if head_name == "residual_policy_head":
+                logits = base_logits[index] + logits
             ce = F.cross_entropy(logits, labels[index], reduction="none")
             weighted_ce = (ce * weights[index]).sum() / weights[index].sum().clamp_min(1e-6)
             kl_per_sample = F.kl_div(
@@ -641,9 +751,21 @@ def main() -> int:
     parser.add_argument("--anchor-weight", type=float, default=1.0)
     parser.add_argument("--teacher-kl-weight", type=float, default=0.01)
     parser.add_argument("--anchor-kl-weight", type=float, default=0.1)
-    parser.add_argument("--teacher-mode", choices=["cycle", "grid_shortest", "grid_path"], default="cycle")
+    parser.add_argument("--teacher-mode", choices=["cycle", "grid_shortest", "grid_path", "tail_path"], default="cycle")
     parser.add_argument("--max-plan-nodes", type=int, default=2000)
     parser.add_argument("--max-plan-candidates", type=int, default=64)
+    parser.add_argument(
+        "--shortcut-score-max",
+        type=int,
+        default=-1,
+        help="For tail_path, use shortcut labels only through this score, then fall back to the cycle teacher (-1 = no cutoff).",
+    )
+    parser.add_argument(
+        "--teacher-rollout-policy",
+        choices=["teacher", "base"],
+        default="teacher",
+        help="Step teacher seeds with teacher actions, or keep rollouts on the base policy while labeling shortcut corrections.",
+    )
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--save-all", action="store_true")
     args = parser.parse_args()
@@ -674,6 +796,8 @@ def main() -> int:
         teacher_mode=args.teacher_mode,
         max_plan_nodes=max(1, args.max_plan_nodes),
         max_plan_candidates=max(1, args.max_plan_candidates),
+        shortcut_score_max=args.shortcut_score_max,
+        teacher_rollout_policy=args.teacher_rollout_policy,
     )
     dataset_summary = {
         "samples": int(dataset["labels"].shape[0]),
@@ -684,6 +808,8 @@ def main() -> int:
         "anchor_stride": max(1, args.anchor_stride),
         "corrections": int(sum(record.get("corrections", 0) for record in dataset["seed_records"])),
         "teacher_mode": args.teacher_mode,
+        "teacher_rollout_policy": args.teacher_rollout_policy,
+        "shortcut_score_max": args.shortcut_score_max,
         "max_plan_nodes": max(1, args.max_plan_nodes),
         "max_plan_candidates": max(1, args.max_plan_candidates),
         "seed_records": dataset["seed_records"],

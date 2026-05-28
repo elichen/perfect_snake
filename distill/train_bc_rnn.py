@@ -18,9 +18,19 @@ from .conditioning import augment_observation, conditioning_channels
 from .evaluate_rnn import evaluate_policy
 from .expert import expert_action, find_aligned_cycle
 from .rnn_model import SnakeRNNPolicy, freeze_except_early_head, load_rnn_policy_state
+from rnn_cycle_shortcut_patch import _teacher_action
 
 
 START_ACTION_TOKEN = 3
+
+
+def _parse_seed_list(value: str | None) -> list[int] | None:
+    if value is None:
+        return None
+    seeds = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not seeds:
+        raise argparse.ArgumentTypeError("seed list cannot be empty")
+    return seeds
 
 
 def _save_atomic(payload, path: str) -> None:
@@ -209,6 +219,11 @@ def _collect_episode(
     use_prev_action_input: bool,
     use_fill_input: bool,
     beta: float,
+    teacher_mode: str,
+    max_episode_steps: int,
+    max_plan_nodes: int,
+    max_plan_candidates: int,
+    shortcut_score_max: int,
     perturb_config: PerturbConfig | None = None,
 ) -> EpisodeTrajectory:
     env = _make_env(
@@ -219,6 +234,7 @@ def _collect_episode(
     )
     obs, _ = env.reset(seed=seed)
     cycle, head_idx = find_aligned_cycle(env)
+    cycle_index = {pos: idx for idx, pos in enumerate(cycle)}
     cycle_idx = env._curriculum_cycles.index(cycle) if cycle_conditioning else None
     hidden = policy.initial_state(1, device) if policy is not None else None
     prev_action = START_ACTION_TOKEN
@@ -232,14 +248,26 @@ def _collect_episode(
     score = 0
     reason = "unknown"
     done = False
-    max_steps = board_size * board_size * 2
+    max_steps = max_episode_steps
     steps = 0
     perturb_remaining = 0
 
     while not done and steps < max_steps:
         steps += 1
         fill_fraction = env.snake_length / float(board_size * board_size)
-        expert, next_head_idx = expert_action(env, cycle, head_idx)
+        if teacher_mode == "hamiltonian":
+            expert, next_head_idx = expert_action(env, cycle, head_idx)
+        else:
+            expert = _teacher_action(
+                env,
+                cycle,
+                cycle_index,
+                teacher_mode,
+                max_plan_nodes=max_plan_nodes,
+                max_plan_candidates=max_plan_candidates,
+                shortcut_score_max=shortcut_score_max,
+            )
+            next_head_idx = cycle_index.get(_target_head_after_action(env, expert), head_idx)
         obs_eval = _prepare_observation(
             obs,
             env,
@@ -271,7 +299,7 @@ def _collect_episode(
             if use_prev_action_input:
                 prev_t = torch.as_tensor([prev_action], dtype=torch.long, device=device)
             fill_t = None
-            if use_fill_input:
+            if use_fill_input or getattr(policy, "early_head_max_fill", None) is not None:
                 fill_t = torch.as_tensor([fill_fraction], dtype=torch.float32, device=device)
             logits, hidden = policy.forward_step(
                 obs_t,
@@ -294,6 +322,7 @@ def _collect_episode(
         else:
             try:
                 cycle, head_idx = find_aligned_cycle(env)
+                cycle_index = {pos: idx for idx, pos in enumerate(cycle)}
                 if cycle_conditioning:
                     cycle_idx = env._curriculum_cycles.index(cycle)
             except RuntimeError:
@@ -317,12 +346,20 @@ def _collect_episode(
     )
 
 
+def _target_head_after_action(env: SnakeEnv, action: int) -> tuple[int, int]:
+    new_dir = (env.direction + {0: -1, 1: 0, 2: 1}[int(action)]) % 4
+    dr, dc = env.DIRECTIONS[new_dir]
+    hr, hc = env.snake_head
+    return hr + dr, hc + dc
+
+
 def _collect_episodes(
     *,
     target_pool: TrajectoryPool,
     predeath_pool: TrajectoryPool | None,
     episodes: int,
     seed_start: int,
+    seed_sequence: list[int] | None,
     policy: SnakeRNNPolicy | None,
     board_size: int,
     flood_fill: bool,
@@ -333,24 +370,36 @@ def _collect_episodes(
     use_fill_input: bool,
     beta: float,
     predeath_window: int,
+    teacher_mode: str,
+    max_episode_steps: int,
+    max_plan_nodes: int,
+    max_plan_candidates: int,
+    shortcut_score_max: int,
     perturb_config: PerturbConfig | None = None,
 ) -> int:
     seed_cursor = seed_start
-    for _ in range(episodes):
+    seeds = seed_sequence if seed_sequence is not None else list(range(seed_start, seed_start + episodes))
+    for episode_seed in seeds:
         episode = _collect_episode(
             policy=policy,
             board_size=board_size,
             flood_fill=flood_fill,
             head_centered=head_centered,
             device=device,
-            seed=seed_cursor,
+            seed=episode_seed,
             cycle_conditioning=cycle_conditioning,
             use_prev_action_input=use_prev_action_input,
             use_fill_input=use_fill_input,
             beta=beta,
+            teacher_mode=teacher_mode,
+            max_episode_steps=max_episode_steps,
+            max_plan_nodes=max_plan_nodes,
+            max_plan_candidates=max_plan_candidates,
+            shortcut_score_max=shortcut_score_max,
             perturb_config=perturb_config,
         )
-        seed_cursor += 1
+        if seed_sequence is None:
+            seed_cursor += 1
         target_pool.add(episode)
         if predeath_pool is not None and episode.score < (board_size * board_size - 3):
             predeath_pool.add(episode.as_predeath_window(predeath_window))
@@ -452,6 +501,7 @@ def _sample_mixed_batch(
 def _train_round(
     *,
     policy: SnakeRNNPolicy,
+    anchor_policy: SnakeRNNPolicy | None,
     optimizer: torch.optim.Optimizer,
     expert_pool: TrajectoryPool,
     student_pool: TrajectoryPool,
@@ -472,6 +522,7 @@ def _train_round(
     safe_target_temperature: float,
     future_action_horizon: int,
     future_action_coef: float,
+    kl_coef: float,
     expert_target_min_fill: float,
     expert_target_max_fill: float,
 ) -> tuple[dict[str, float], dict[str, int]]:
@@ -500,20 +551,32 @@ def _train_round(
         mask_t = torch.as_tensor(batch["loss_mask"], dtype=torch.float32, device=device)
 
         need_features = future_action_coef > 0.0 and future_action_horizon > 0
+        needs_fill_values = policy.fill_input or getattr(policy, "early_head_max_fill", None) is not None
         if need_features:
             logits, _, hidden_states = policy.forward_sequence(
                 obs_t,
                 prev_actions=prev_t if policy.prev_action_input else None,
-                fill_values=fill_t if policy.fill_input else None,
+                fill_values=fill_t if needs_fill_values else None,
                 return_features=True,
             )
         else:
             logits, _ = policy.forward_sequence(
                 obs_t,
                 prev_actions=prev_t if policy.prev_action_input else None,
-                fill_values=fill_t if policy.fill_input else None,
+                fill_values=fill_t if needs_fill_values else None,
             )
             hidden_states = None
+
+        kl_loss = None
+        if kl_coef > 0.0 and anchor_policy is not None:
+            with torch.no_grad():
+                anchor_logits, _ = anchor_policy.forward_sequence(
+                    obs_t,
+                    prev_actions=prev_t if anchor_policy.prev_action_input else None,
+                    fill_values=fill_t if needs_fill_values else None,
+                )
+                anchor_log_probs = F.log_softmax(anchor_logits, dim=-1)
+                anchor_probs = anchor_log_probs.exp()
         ce = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             act_t.reshape(-1),
@@ -533,6 +596,12 @@ def _train_round(
 
         safe_loss = None
         future_loss = None
+        if kl_loss is None and kl_coef > 0.0 and anchor_policy is not None and torch.any(valid):
+            current_log_probs = F.log_softmax(logits, dim=-1)
+            kl_values = (anchor_probs * (anchor_log_probs - current_log_probs)).sum(dim=-1)
+            kl_loss = kl_values[valid].mean()
+            loss = loss + kl_coef * kl_loss
+
         if safe_target_coef > 0.0:
             safe_target, safe_valid = _safe_target_distribution(
                 safe_t,
@@ -565,6 +634,7 @@ def _train_round(
             "accuracy": float(accuracy.item()),
             "safe_loss": float(safe_loss.item()) if safe_loss is not None else None,
             "future_loss": float(future_loss.item()) if future_loss is not None else None,
+            "kl_loss": float(kl_loss.item()) if kl_loss is not None else None,
         }
         last_counts = counts
         if step % log_every == 0 or step == 1 or step == steps:
@@ -575,10 +645,19 @@ def _train_round(
                     "accuracy": round(last_metrics["accuracy"], 4),
                     "safe_loss": None if last_metrics["safe_loss"] is None else round(last_metrics["safe_loss"], 6),
                     "future_loss": None if last_metrics["future_loss"] is None else round(last_metrics["future_loss"], 6),
+                    "kl_loss": None if last_metrics["kl_loss"] is None else round(last_metrics["kl_loss"], 6),
                     **counts,
                 }
             )
 
+    if not last_metrics:
+        last_metrics = {
+            "loss": 0.0,
+            "accuracy": 0.0,
+            "safe_loss": None,
+            "future_loss": None,
+            "kl_loss": None,
+        }
     return last_metrics, last_counts
 
 
@@ -734,6 +813,7 @@ def main() -> None:
     parser.add_argument("--burn-in", type=int, default=16)
     parser.add_argument("--offline-episodes", type=int, default=32)
     parser.add_argument("--student-episodes", type=int, default=24, help="Student rollout episodes per DAgger round")
+    parser.add_argument("--student-seeds", type=_parse_seed_list, default=None)
     parser.add_argument("--recovery-episodes", type=int, default=0, help="Perturb-and-relabel episodes per DAgger round")
     parser.add_argument("--predeath-window", type=int, default=16)
     parser.add_argument("--student-mix-ratio", type=float, default=0.30)
@@ -748,8 +828,23 @@ def main() -> None:
     parser.add_argument("--safe-target-min-fill", type=float, default=0.0)
     parser.add_argument("--safe-target-max-fill", type=float, default=1.0)
     parser.add_argument("--safe-target-temperature", type=float, default=50.0)
+    parser.add_argument(
+        "--teacher-mode",
+        choices=["hamiltonian", "cycle", "grid_shortest", "grid_path", "tail_path"],
+        default="hamiltonian",
+    )
+    parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=0,
+        help="Maximum rollout steps while collecting teacher episodes. 0 keeps the historical 2*board_area cap.",
+    )
+    parser.add_argument("--max-plan-nodes", type=int, default=2000)
+    parser.add_argument("--max-plan-candidates", type=int, default=64)
+    parser.add_argument("--shortcut-score-max", type=int, default=-1)
     parser.add_argument("--future-action-horizon", type=int, default=0)
     parser.add_argument("--future-action-coef", type=float, default=0.0)
+    parser.add_argument("--kl-coef", type=float, default=0.0, help="Anchor policy KL penalty against --resume")
     parser.add_argument("--expert-target-min-fill", type=float, default=0.0)
     parser.add_argument("--expert-target-max-fill", type=float, default=1.0)
     parser.add_argument("--early-head-max-fill", type=float, default=None)
@@ -805,10 +900,16 @@ def main() -> None:
         raise SystemExit("--safe-target-min-fill/--safe-target-max-fill must satisfy 0 <= min <= max <= 1")
     if args.safe_target_temperature <= 0.0:
         raise SystemExit("--safe-target-temperature must be > 0")
+    if args.max_episode_steps < 0:
+        raise SystemExit("--max-episode-steps must be >= 0")
     if args.future_action_horizon < 0:
         raise SystemExit("--future-action-horizon must be >= 0")
     if args.future_action_coef < 0.0:
         raise SystemExit("--future-action-coef must be >= 0")
+    if args.kl_coef < 0.0:
+        raise SystemExit("--kl-coef must be >= 0")
+    if args.kl_coef > 0.0 and not args.resume:
+        raise SystemExit("--kl-coef requires --resume")
     if not (0.0 <= args.expert_target_min_fill <= args.expert_target_max_fill <= 1.0):
         raise SystemExit("--expert-target-min-fill/--expert-target-max-fill must satisfy 0 <= min <= max <= 1")
     if args.early_head_max_fill is not None and not (0.0 <= args.early_head_max_fill <= 1.0):
@@ -843,6 +944,23 @@ def main() -> None:
     if args.resume:
         state = torch.load(args.resume, map_location="cpu")
         load_rnn_policy_state(policy, state)
+    anchor_policy = None
+    if args.kl_coef > 0.0:
+        anchor_policy = SnakeRNNPolicy(
+            board_size=args.board_size,
+            n_channels=n_channels,
+            flood_fill=args.flood_fill,
+            head_centered=args.head_centered,
+            hidden_size=args.hidden_size,
+            prev_action_input=args.prev_action_input,
+            fill_input=args.fill_input,
+            future_action_horizon=args.future_action_horizon,
+            early_head_max_fill=args.early_head_max_fill,
+        ).to(args.device)
+        load_rnn_policy_state(anchor_policy, state)
+        anchor_policy.eval()
+        for param in anchor_policy.parameters():
+            param.requires_grad_(False)
     if args.train_early_head_only:
         freeze_except_early_head(policy)
 
@@ -853,6 +971,7 @@ def main() -> None:
     summary_events: list[dict] = []
     start = time.time()
     seed_cursor = args.seed
+    max_episode_steps = args.max_episode_steps or (args.board_size * args.board_size * 2)
 
     expert_pool = TrajectoryPool()
     student_pool = TrajectoryPool()
@@ -863,6 +982,7 @@ def main() -> None:
         predeath_pool=None,
         episodes=args.offline_episodes,
         seed_start=seed_cursor,
+        seed_sequence=None,
         policy=None,
         board_size=args.board_size,
         flood_fill=args.flood_fill,
@@ -873,6 +993,11 @@ def main() -> None:
         use_fill_input=args.fill_input,
         beta=1.0,
         predeath_window=args.predeath_window,
+        teacher_mode=args.teacher_mode,
+        max_episode_steps=max_episode_steps,
+        max_plan_nodes=max(1, args.max_plan_nodes),
+        max_plan_candidates=max(1, args.max_plan_candidates),
+        shortcut_score_max=args.shortcut_score_max,
         perturb_config=None,
     )
     print(
@@ -885,6 +1010,7 @@ def main() -> None:
 
     stage_metrics, stage_counts = _train_round(
         policy=policy,
+        anchor_policy=anchor_policy,
         optimizer=optimizer,
         expert_pool=expert_pool,
         student_pool=student_pool,
@@ -905,6 +1031,7 @@ def main() -> None:
         safe_target_temperature=args.safe_target_temperature,
         future_action_horizon=args.future_action_horizon,
         future_action_coef=args.future_action_coef,
+        kl_coef=args.kl_coef,
         expert_target_min_fill=args.expert_target_min_fill,
         expert_target_max_fill=args.expert_target_max_fill,
     )
@@ -958,6 +1085,7 @@ def main() -> None:
                 predeath_pool=predeath_pool,
                 episodes=args.recovery_episodes,
                 seed_start=seed_cursor,
+                seed_sequence=None,
                 policy=None,
                 board_size=args.board_size,
                 flood_fill=args.flood_fill,
@@ -968,6 +1096,11 @@ def main() -> None:
                 use_fill_input=args.fill_input,
                 beta=1.0,
                 predeath_window=args.predeath_window,
+                teacher_mode=args.teacher_mode,
+                max_episode_steps=max_episode_steps,
+                max_plan_nodes=max(1, args.max_plan_nodes),
+                max_plan_candidates=max(1, args.max_plan_candidates),
+                shortcut_score_max=args.shortcut_score_max,
                 perturb_config=perturb_config,
             )
             print(
@@ -982,8 +1115,9 @@ def main() -> None:
         seed_cursor = _collect_episodes(
             target_pool=student_pool,
             predeath_pool=predeath_pool,
-            episodes=args.student_episodes,
+            episodes=len(args.student_seeds) if args.student_seeds is not None else args.student_episodes,
             seed_start=seed_cursor,
+            seed_sequence=args.student_seeds,
             policy=policy,
             board_size=args.board_size,
             flood_fill=args.flood_fill,
@@ -994,6 +1128,11 @@ def main() -> None:
             use_fill_input=args.fill_input,
             beta=beta,
             predeath_window=args.predeath_window,
+            teacher_mode=args.teacher_mode,
+            max_episode_steps=max_episode_steps,
+            max_plan_nodes=max(1, args.max_plan_nodes),
+            max_plan_candidates=max(1, args.max_plan_candidates),
+            shortcut_score_max=args.shortcut_score_max,
             perturb_config=None,
         )
         print(
@@ -1010,6 +1149,7 @@ def main() -> None:
         policy.train()
         round_metrics, round_counts = _train_round(
             policy=policy,
+            anchor_policy=anchor_policy,
             optimizer=optimizer,
             expert_pool=expert_pool,
             student_pool=student_pool,
@@ -1030,6 +1170,7 @@ def main() -> None:
             safe_target_temperature=args.safe_target_temperature,
             future_action_horizon=args.future_action_horizon,
             future_action_coef=args.future_action_coef,
+            kl_coef=args.kl_coef,
             expert_target_min_fill=args.expert_target_min_fill,
             expert_target_max_fill=args.expert_target_max_fill,
         )

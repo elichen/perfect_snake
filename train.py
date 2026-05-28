@@ -492,6 +492,210 @@ class SnakePolicy(nn.Module):
         return pred.view(-1, 1, n, n)
 
 
+class SnakeRecurrentPPOPolicy(nn.Module):
+    """LSTM policy for PufferLib recurrent PPO."""
+
+    def __init__(
+        self,
+        env,
+        scale: int = 1,
+        hidden_size: int = 256,
+        embed_size: int | None = None,
+        board_size: int | None = None,
+        head_centered: bool = False,
+        full_ff_encoder: bool = False,
+        residual_recurrent: bool = False,
+    ):
+        super().__init__()
+
+        obs_space = getattr(env, "single_observation_space", env.observation_space)
+        act_space = getattr(env, "single_action_space", env.action_space)
+        obs_shape = obs_space.shape
+        n_actions = act_space.n
+
+        self.obs_shape = obs_shape
+        self.encoder_channels = obs_shape[0]
+        self.hidden_size = int(hidden_size)
+        self.head_centered = head_centered
+        self.full_ff_encoder = bool(full_ff_encoder)
+        self.residual_recurrent = bool(residual_recurrent)
+        if board_size is not None:
+            self.board_size = board_size
+        else:
+            self.board_size = obs_shape[1] - 2
+
+        if embed_size is None:
+            embed_size = 256 if scale <= 1 else 512
+        trunk = 1024 if scale <= 1 else 2048
+        if scale >= 4:
+            trunk = 4096
+
+        n_input = int(np.prod(obs_shape))
+        if self.full_ff_encoder:
+            w = [1024, 512, 256, 128]
+            if scale == 2:
+                w = [2048, 1024, 512, 256]
+            elif scale == 4:
+                w = [4096, 2048, 1024, 512]
+            recurrent_input_size = w[-1]
+            self.encoder = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(n_input, w[0]),
+                nn.LayerNorm(w[0]),
+                nn.ReLU(),
+                nn.Linear(w[0], w[1]),
+                nn.LayerNorm(w[1]),
+                nn.ReLU(),
+                nn.Linear(w[1], w[2]),
+                nn.LayerNorm(w[2]),
+                nn.ReLU(),
+                nn.Linear(w[2], w[3]),
+                nn.ReLU(),
+            )
+        else:
+            recurrent_input_size = int(embed_size)
+            self.encoder = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(n_input, trunk),
+                nn.LayerNorm(trunk),
+                nn.ReLU(),
+                nn.Linear(trunk, int(embed_size)),
+                nn.LayerNorm(int(embed_size)),
+                nn.ReLU(),
+            )
+        if self.residual_recurrent and recurrent_input_size != self.hidden_size:
+            raise ValueError("--recurrent-residual requires recurrent input size to match hidden size")
+
+        self.lstm = nn.LSTM(recurrent_input_size, self.hidden_size)
+        self.cell = nn.LSTMCell(recurrent_input_size, self.hidden_size)
+        self.cell.weight_ih = self.lstm.weight_ih_l0
+        self.cell.weight_hh = self.lstm.weight_hh_l0
+        self.cell.bias_ih = self.lstm.bias_ih_l0
+        self.cell.bias_hh = self.lstm.bias_hh_l0
+
+        self.policy_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size // 2, n_actions),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size // 2, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, (nn.LSTM, nn.LSTMCell)):
+                for name, param in module.named_parameters():
+                    if "weight" in name and param.ndim >= 2:
+                        nn.init.orthogonal_(param, gain=1.0)
+                    elif "bias" in name:
+                        nn.init.zeros_(param)
+
+    def initial_state(self, batch_size: int, device: str | torch.device) -> dict[str, torch.Tensor]:
+        return {
+            "lstm_h": torch.zeros(batch_size, self.hidden_size, device=device),
+            "lstm_c": torch.zeros(batch_size, self.hidden_size, device=device),
+        }
+
+    def _encode_flat(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.encoder(observations[:, :self.encoder_channels])
+
+    def _decode(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.policy_head(hidden), self.value_head(hidden)
+
+    def zero_recurrent_weights(self) -> None:
+        for param in self.lstm.parameters():
+            nn.init.zeros_(param)
+
+    def _state_tensors(
+        self,
+        state: dict | None,
+        batch_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if state is None or state.get("lstm_h") is None or state.get("lstm_c") is None:
+            zeros = self.initial_state(batch_size, device)
+            return zeros["lstm_h"], zeros["lstm_c"]
+        h = state["lstm_h"]
+        c = state["lstm_c"]
+        if h.ndim == 3:
+            h = h.squeeze(0)
+        if c.ndim == 3:
+            c = c.squeeze(0)
+        return h, c
+
+    def forward_eval(self, observations, state=None):
+        batch_size = observations.shape[0]
+        encoded = self._encode_flat(observations)
+        h, c = self._state_tensors(state, batch_size, observations.device)
+
+        if state is not None and "done" in state:
+            done = torch.as_tensor(state["done"], device=observations.device).bool().view(batch_size)
+            keep = (~done).float().unsqueeze(-1)
+            h = h * keep
+            c = c * keep
+
+        h, c = self.cell(encoded, (h, c))
+        if state is not None:
+            state["lstm_h"] = h.detach()
+            state["lstm_c"] = c.detach()
+        features = encoded + h if self.residual_recurrent else h
+        return self._decode(features)
+
+    def forward(self, observations, state=None):
+        obs_shape = self.obs_shape
+        obs_dims = len(obs_shape)
+        if tuple(observations.shape[-obs_dims:]) != tuple(obs_shape):
+            raise ValueError(f"invalid observation shape: {tuple(observations.shape)}")
+        if observations.ndim == obs_dims + 1:
+            return self.forward_eval(observations, state)
+        if observations.ndim != obs_dims + 2:
+            raise ValueError(f"invalid observation shape: {tuple(observations.shape)}")
+
+        batch_size, timesteps = observations.shape[:2]
+        flat_obs = observations.reshape(batch_size * timesteps, *obs_shape)
+        encoded = self._encode_flat(flat_obs).reshape(batch_size, timesteps, -1)
+        encoded = encoded.transpose(0, 1)
+
+        h, c = self._state_tensors(state, batch_size, observations.device)
+        done = None
+        if state is not None and state.get("done") is not None:
+            done = torch.as_tensor(state["done"], device=observations.device).bool()
+            done = done.view(batch_size, timesteps)
+
+        if done is None:
+            outputs, (h_n, c_n) = self.lstm(encoded, (h.unsqueeze(0), c.unsqueeze(0)))
+        else:
+            step_outputs = []
+            for t in range(timesteps):
+                keep = (~done[:, t]).float().unsqueeze(-1)
+                h = h * keep
+                c = c * keep
+                h, c = self.cell(encoded[t], (h, c))
+                step_outputs.append(h)
+            outputs = torch.stack(step_outputs, dim=0)
+            h_n = h.unsqueeze(0)
+            c_n = c.unsqueeze(0)
+        outputs = outputs.transpose(0, 1)
+        if self.residual_recurrent:
+            outputs = outputs + encoded.transpose(0, 1)
+        outputs = outputs.reshape(batch_size * timesteps, self.hidden_size)
+        logits, values = self._decode(outputs)
+        if state is not None:
+            state["lstm_h"] = h_n.detach()
+            state["lstm_c"] = c_n.detach()
+        return logits, values.reshape(batch_size, timesteps)
+
+
 class SnakeCNNPolicy(nn.Module):
     """CNN policy for Snake - better at spatial patterns."""
 
@@ -861,60 +1065,117 @@ def evaluate_policy(
     safe_action_bonus_min_fill: float = 0.95,
     safe_action_bonus_fill_weight: float = 500.0,
     head_centered: bool = False,
+    num_envs: int = 1,
 ) -> dict:
-    env = SnakeEnv(
-        n=board_size,
-        gamma=gamma,
-        alpha=alpha,
-        seed=seed,
-        flood_fill_obs=flood_fill_obs,
-        body_age_obs=body_age_obs,
-        obs_history=obs_history,
-        action_history_obs=action_history_obs,
-        cycle_target_obs=cycle_target_obs,
-        tail_target_obs=tail_target_obs,
-        cycle_target_min_fill=cycle_target_min_fill,
-        safe_action_target_obs=safe_action_target_obs,
-        safe_action_soft_target_obs=safe_action_soft_target_obs,
-        safe_action_target_min_fill=safe_action_target_min_fill,
-        safe_action_soft_target_min_fill=safe_action_soft_target_min_fill,
-        body_age_target_obs=body_age_target_obs,
-        body_age_target_min_fill=body_age_target_min_fill,
-        safe_action_fill_weight=safe_action_fill_weight,
-        safe_action_soft_temperature=safe_action_soft_temperature,
-        safe_action_bonus=safe_action_bonus,
-        safe_action_bonus_min_fill=safe_action_bonus_min_fill,
-        safe_action_bonus_fill_weight=safe_action_bonus_fill_weight,
-        head_centered=head_centered,
-    )
-
     perfect_score = board_size * board_size - 3
     scores = []
     terminal_lengths = []
     reasons = []
     wins = 0
 
-    policy.eval()
-    for ep in range(episodes):
-        obs, info = env.reset(seed=seed + ep)
-        done = False
-        last_info = info
-        while not done:
-            obs_t = torch.as_tensor(obs, device=device).unsqueeze(0)
-            logits, _ = policy.forward_eval(obs_t, state=None)
-            if deterministic:
-                action = int(torch.argmax(logits, dim=-1).item())
-            else:
-                action = int(torch.distributions.Categorical(logits=logits).sample().item())
-            obs, _, terminated, truncated, last_info = env.step(action)
-            done = terminated or truncated
+    def make_eval_env(env_seed: int) -> SnakeEnv:
+        return SnakeEnv(
+            n=board_size,
+            gamma=gamma,
+            alpha=alpha,
+            seed=env_seed,
+            flood_fill_obs=flood_fill_obs,
+            body_age_obs=body_age_obs,
+            obs_history=obs_history,
+            action_history_obs=action_history_obs,
+            cycle_target_obs=cycle_target_obs,
+            tail_target_obs=tail_target_obs,
+            cycle_target_min_fill=cycle_target_min_fill,
+            safe_action_target_obs=safe_action_target_obs,
+            safe_action_soft_target_obs=safe_action_soft_target_obs,
+            safe_action_target_min_fill=safe_action_target_min_fill,
+            safe_action_soft_target_min_fill=safe_action_soft_target_min_fill,
+            body_age_target_obs=body_age_target_obs,
+            body_age_target_min_fill=body_age_target_min_fill,
+            safe_action_fill_weight=safe_action_fill_weight,
+            safe_action_soft_temperature=safe_action_soft_temperature,
+            safe_action_bonus=safe_action_bonus,
+            safe_action_bonus_min_fill=safe_action_bonus_min_fill,
+            safe_action_bonus_fill_weight=safe_action_bonus_fill_weight,
+            head_centered=head_centered,
+        )
 
+    def record_episode(last_info: dict) -> None:
+        nonlocal wins
         score = int(last_info.get("score", 0))
         terminal_lengths.append(int(last_info.get("length", score + 3)))
         reasons.append(str(last_info.get("reason", "unknown")))
         scores.append(score)
         if score >= perfect_score:
             wins += 1
+
+    policy.eval()
+    num_envs = max(1, min(int(num_envs), int(episodes)))
+    if num_envs > 1:
+        envs = [make_eval_env(seed + i) for i in range(num_envs)]
+        observations = []
+        active = [True] * num_envs
+        next_episode = 0
+        for slot in range(num_envs):
+            obs, _ = envs[slot].reset(seed=seed + next_episode)
+            observations.append(obs)
+            next_episode += 1
+        state = policy.initial_state(num_envs, device) if hasattr(policy, "initial_state") else None
+
+        while len(scores) < episodes and any(active):
+            active_slots = [slot for slot, is_active in enumerate(active) if is_active]
+            obs_t = torch.as_tensor(
+                np.stack([observations[slot] for slot in active_slots]),
+                device=device,
+            )
+            state_view = None
+            if state is not None:
+                idx_t = torch.as_tensor(active_slots, device=device, dtype=torch.long)
+                state_view = {
+                    "lstm_h": state["lstm_h"].index_select(0, idx_t).clone(),
+                    "lstm_c": state["lstm_c"].index_select(0, idx_t).clone(),
+                }
+            logits, _ = policy.forward_eval(obs_t, state=state_view)
+            if deterministic:
+                actions = torch.argmax(logits, dim=-1).detach().cpu().numpy()
+            else:
+                actions = torch.distributions.Categorical(logits=logits).sample().detach().cpu().numpy()
+            if state is not None:
+                state["lstm_h"][idx_t] = state_view["lstm_h"]
+                state["lstm_c"][idx_t] = state_view["lstm_c"]
+
+            for pos, slot in enumerate(active_slots):
+                obs, _, terminated, truncated, last_info = envs[slot].step(int(actions[pos]))
+                done = terminated or truncated
+                if done:
+                    record_episode(last_info)
+                    if next_episode < episodes:
+                        observations[slot], _ = envs[slot].reset(seed=seed + next_episode)
+                        next_episode += 1
+                        if state is not None:
+                            state["lstm_h"][slot].zero_()
+                            state["lstm_c"][slot].zero_()
+                    else:
+                        active[slot] = False
+                else:
+                    observations[slot] = obs
+    else:
+        env = make_eval_env(seed)
+        for ep in range(episodes):
+            obs, info = env.reset(seed=seed + ep)
+            state = policy.initial_state(1, device) if hasattr(policy, "initial_state") else None
+            done = False
+            last_info = info
+            while not done:
+                obs_t = torch.as_tensor(obs, device=device).unsqueeze(0)
+                logits, _ = policy.forward_eval(obs_t, state=state)
+                if deterministic:
+                    action = int(torch.argmax(logits, dim=-1).item())
+                else:
+                    action = int(torch.distributions.Categorical(logits=logits).sample().item())
+                obs, _, terminated, truncated, last_info = env.step(action)
+                done = terminated or truncated
+            record_episode(last_info)
 
     stats = {
         "mean_score": float(np.mean(scores)) if scores else 0.0,
@@ -1043,6 +1304,43 @@ def _load_policy_state(
             sync_late()
 
 
+def _init_recurrent_from_ff(policy: nn.Module, state: dict) -> dict[str, list[str]]:
+    """Initialize a recurrent policy from a compatible feed-forward PPO checkpoint."""
+    target = policy.state_dict()
+    copied: list[str] = []
+    skipped: list[str] = []
+    remapped = {}
+
+    for source_prefix, target_prefix in (
+        ("features.", "encoder."),
+        ("policy_head.", "policy_head."),
+        ("value_head.", "value_head."),
+    ):
+        for key, value in state.items():
+            if not key.startswith(source_prefix):
+                continue
+            target_key = f"{target_prefix}{key[len(source_prefix):]}"
+            if target_key not in target or target[target_key].shape != value.shape:
+                skipped.append(key)
+                continue
+            remapped[target_key] = value
+            copied.append(f"{key}->{target_key}")
+
+    missing = [key for key in target if key not in remapped and not key.startswith(("lstm.", "cell."))]
+    if missing:
+        raise RuntimeError(
+            "feed-forward checkpoint is not compatible with this recurrent policy; "
+            f"missing mapped keys: {missing[:8]}"
+        )
+
+    target.update(remapped)
+    policy.load_state_dict(target, strict=True)
+    zero_recurrent = getattr(policy, "zero_recurrent_weights", None)
+    if callable(zero_recurrent):
+        zero_recurrent()
+    return {"copied": copied, "skipped": skipped}
+
+
 def _input_layer_shape_mismatch(policy: nn.Module, state: dict) -> bool:
     first_layer_key = "features.1.weight"
     target_state = policy.state_dict()
@@ -1156,10 +1454,19 @@ def main():
     parser.add_argument("--ent-coef-final", type=float, default=None)
     parser.add_argument("--eval-every-steps", type=int, default=0, help="0 = disable")
     parser.add_argument("--eval-episodes", type=int, default=50)
+    parser.add_argument("--eval-num-envs", type=int, default=1, help="Parallel envs for deterministic eval gates")
     parser.add_argument("--eval-deterministic", action="store_true")
     parser.add_argument("--perfect-patience", type=int, default=0, help="0 = disable early stop")
     parser.add_argument("--symmetric", action="store_true", help="Enable symmetric augmentation (50%% horizontal flip)")
     parser.add_argument("--network-scale", type=int, default=1, choices=[1, 2, 4], help="Network width multiplier (1=base, 2=2x, 4=4x)")
+    parser.add_argument("--recurrent", action="store_true", help="Use an LSTM policy with PufferLib recurrent PPO")
+    parser.add_argument("--recurrent-hidden-size", type=int, default=256, help="Hidden size for --recurrent LSTM policy")
+    parser.add_argument("--recurrent-embed-size", type=int, default=0, help="Encoder size for --recurrent policy (0 = scale default)")
+    parser.add_argument("--recurrent-full-ff-encoder", action="store_true", help="Use the feed-forward PPO trunk before the recurrent adapter")
+    parser.add_argument("--recurrent-residual", action="store_true", help="Add LSTM output as a residual correction to encoder features")
+    parser.add_argument("--init-recurrent-from-ff", type=str, default=None, help="Initialize recurrent trunk/heads from a feed-forward PPO checkpoint")
+    parser.add_argument("--train-recurrent-adapter-only", action="store_true", help="Freeze the recurrent policy encoder/heads and train only the LSTM adapter")
+    parser.add_argument("--freeze-recurrent-encoder", action="store_true", help="Freeze the recurrent policy encoder while training the LSTM adapter and heads")
     parser.add_argument("--cnn", action="store_true", help="Use CNN policy instead of MLP")
     parser.add_argument("--resnet", action="store_true", help="Use deep ResNet policy (spatial reasoning)")
     parser.add_argument("--iterative-cnn", action="store_true", help="Use weight-tied iterative CNN policy")
@@ -1242,6 +1549,16 @@ def main():
         help="Path to a reference policy checkpoint used for an explicit KL anchor during continuation",
     )
     parser.add_argument(
+        "--policy-kl-anchor-current",
+        action="store_true",
+        help="Use the initialized policy itself as the explicit KL anchor during continuation",
+    )
+    parser.add_argument(
+        "--policy-kl-anchor-sequence",
+        action="store_true",
+        help="For recurrent policies, compute the KL anchor over rollout sequences instead of one-step states",
+    )
+    parser.add_argument(
         "--policy-kl-anchor-coef",
         type=float,
         default=0.0,
@@ -1258,8 +1575,44 @@ def main():
         raise SystemExit("--num-envs must be >= 1")
     if args.horizon < 1:
         raise SystemExit("--horizon must be >= 1")
+    if args.eval_num_envs < 1:
+        raise SystemExit("--eval-num-envs must be >= 1")
     if args.aux_flood_fill and not args.flood_fill:
         raise SystemExit("--aux-flood-fill requires --flood-fill (for ground truth)")
+    if args.train_recurrent_adapter_only and not args.recurrent:
+        raise SystemExit("--train-recurrent-adapter-only requires --recurrent")
+    if args.freeze_recurrent_encoder and not args.recurrent:
+        raise SystemExit("--freeze-recurrent-encoder requires --recurrent")
+    if args.recurrent:
+        if args.recurrent_hidden_size < 1:
+            raise SystemExit("--recurrent-hidden-size must be >= 1")
+        if args.recurrent_embed_size < 0:
+            raise SystemExit("--recurrent-embed-size must be >= 0")
+        if args.init_recurrent_from_ff is not None and not args.recurrent_full_ff_encoder:
+            raise SystemExit("--init-recurrent-from-ff requires --recurrent-full-ff-encoder")
+        if args.init_recurrent_from_ff is not None and (args.resume or args.resume_state):
+            raise SystemExit("--init-recurrent-from-ff cannot be combined with --resume or --resume-state")
+        if args.cnn or args.resnet or args.iterative_cnn:
+            raise SystemExit("--recurrent cannot be combined with --cnn, --resnet, or --iterative-cnn")
+        if (
+            args.flood_fill
+            or args.body_age_obs
+            or args.obs_history != 1
+            or args.action_history_obs != 0
+            or args.aux_flood_fill
+            or args.aux_cycle_target
+            or args.aux_tail_target
+            or args.aux_safe_action_target
+            or args.aux_safe_action_soft_target
+            or args.aux_body_age_target
+            or args.late_head_min_fill is not None
+            or args.train_late_head_only
+            or args.elite_bc_coef > 0
+        ):
+            raise SystemExit(
+                "--recurrent currently supports pure PPO with base observations only; "
+                "disable obs-history/action-history, flood/body-age, aux targets, late heads, and elite BC"
+            )
     if args.aux_flood_fill and not args.iterative_cnn:
         # MLP with aux flood-fill decoder - supported
         pass
@@ -1277,8 +1630,14 @@ def main():
         raise SystemExit("--aux-body-age-target is currently supported for the default MLP policy only")
     if args.policy_kl_anchor_coef < 0.0:
         raise SystemExit("--policy-kl-anchor-coef must be >= 0")
+    if args.policy_kl_anchor_current and args.policy_kl_anchor_path is not None:
+        raise SystemExit("--policy-kl-anchor-current cannot be combined with --policy-kl-anchor-path")
+    if args.policy_kl_anchor_sequence and not args.recurrent:
+        raise SystemExit("--policy-kl-anchor-sequence requires --recurrent")
     if args.policy_kl_anchor_path is not None and not os.path.exists(args.policy_kl_anchor_path):
         raise SystemExit(f"--policy-kl-anchor-path not found: {args.policy_kl_anchor_path}")
+    if args.init_recurrent_from_ff is not None and not os.path.exists(args.init_recurrent_from_ff):
+        raise SystemExit(f"--init-recurrent-from-ff not found: {args.init_recurrent_from_ff}")
     if args.aux_cycle_target_min_fill is not None and not (0.0 <= args.aux_cycle_target_min_fill <= 1.0):
         raise SystemExit("--aux-cycle-target-min-fill must be in [0, 1]")
     if not (0.0 <= args.aux_safe_action_target_min_fill <= 1.0):
@@ -1400,7 +1759,18 @@ def main():
         vec_kwargs["num_workers"] = num_workers
     vecenv = pufferlib.vector.make(make_snake_env, **vec_kwargs)
 
-    if args.iterative_cnn:
+    if args.recurrent:
+        policy = SnakeRecurrentPPOPolicy(
+            vecenv.driver_env,
+            scale=args.network_scale,
+            hidden_size=args.recurrent_hidden_size,
+            embed_size=(args.recurrent_embed_size or None),
+            board_size=args.board_size,
+            head_centered=args.head_centered,
+            full_ff_encoder=args.recurrent_full_ff_encoder,
+            residual_recurrent=args.recurrent_residual,
+        ).to(args.device)
+    elif args.iterative_cnn:
         policy = SnakeIterativeCNNPolicy(
             vecenv.driver_env, scale=args.network_scale,
             n_iterations=args.n_iterations, aux_flood_fill=args.aux_flood_fill,
@@ -1466,6 +1836,15 @@ def main():
             else:
                 print(f"warning: resume model not found: {resume_model}", file=sys.stderr)
 
+    if args.init_recurrent_from_ff is not None:
+        ff_state = torch.load(args.init_recurrent_from_ff, map_location="cpu")
+        init_report = _init_recurrent_from_ff(policy, ff_state)
+        print(
+            "initialized recurrent policy from feed-forward checkpoint: "
+            f"copied={len(init_report['copied'])} skipped={len(init_report['skipped'])}",
+            flush=True,
+        )
+
     if args.train_late_head_only:
         policy._late_head_grad_hooks = []
         for name, param in policy.named_parameters():
@@ -1475,19 +1854,37 @@ def main():
                 param.register_hook(lambda grad: torch.zeros_like(grad))
             )
 
+    if args.train_recurrent_adapter_only:
+        policy._recurrent_adapter_grad_hooks = []
+        for name, param in policy.named_parameters():
+            if name.startswith("lstm."):
+                continue
+            policy._recurrent_adapter_grad_hooks.append(
+                param.register_hook(lambda grad: torch.zeros_like(grad))
+            )
+
+    if args.freeze_recurrent_encoder:
+        for name, param in policy.named_parameters():
+            if name.startswith("encoder."):
+                param.requires_grad_(False)
+
     reference_policy = None
-    policy_kl_anchor_active = args.policy_kl_anchor_path is not None and args.policy_kl_anchor_coef > 0.0
+    policy_kl_anchor_active = (
+        (args.policy_kl_anchor_current or args.policy_kl_anchor_path is not None)
+        and args.policy_kl_anchor_coef > 0.0
+    )
     if policy_kl_anchor_active:
         reference_policy = copy.deepcopy(policy).to(args.device)
-        anchor_state = torch.load(args.policy_kl_anchor_path, map_location="cpu")
-        _load_policy_state(
-            reference_policy,
-            anchor_state,
-            allow_missing_cycle_target=args.aux_cycle_target,
-            allow_missing_tail_target=args.aux_tail_target,
-            allow_missing_body_age_target=args.aux_body_age_target,
-            allow_missing_late_head=args.late_head_min_fill is not None,
-        )
+        if args.policy_kl_anchor_path is not None:
+            anchor_state = torch.load(args.policy_kl_anchor_path, map_location="cpu")
+            _load_policy_state(
+                reference_policy,
+                anchor_state,
+                allow_missing_cycle_target=args.aux_cycle_target,
+                allow_missing_tail_target=args.aux_tail_target,
+                allow_missing_body_age_target=args.aux_body_age_target,
+                allow_missing_late_head=args.late_head_min_fill is not None,
+            )
         reference_policy.eval()
         for param in reference_policy.parameters():
             param.requires_grad_(False)
@@ -1546,7 +1943,7 @@ def main():
         "vtrace_c_clip": 1.0,
         "prio_alpha": float(args.prio_alpha),
         "prio_beta0": float(args.prio_beta0),
-        "use_rnn": False,
+        "use_rnn": bool(args.recurrent),
         "checkpoint_interval": int(args.checkpoint_interval),
         "data_dir": str(args.data_dir),
     }
@@ -1949,12 +2346,37 @@ def main():
                 aux_total_loss = elite_weighted if aux_total_loss is None else aux_total_loss + elite_weighted
 
             if policy_kl_anchor_active and reference_policy is not None:
-                current_logits, _ = policy.forward_eval(mb)
+                if args.policy_kl_anchor_sequence:
+                    obs_segments = obs_buf
+                    n_segments = obs_segments.shape[0]
+                    aux_segments = min(16, n_segments)
+                    seq_idx = torch.randperm(n_segments, device=obs_segments.device)[:aux_segments]
+                    seq_mb = obs_segments[seq_idx]
+                    seq_done = trainer.terminals[seq_idx]
+                    seq_h = trainer.lstm_initial_h[:, seq_idx].detach().clone()
+                    seq_c = trainer.lstm_initial_c[:, seq_idx].detach().clone()
+                    seq_state = {
+                        "lstm_h": seq_h,
+                        "lstm_c": seq_c,
+                        "done": seq_done,
+                    }
+                    current_logits, _ = policy(seq_mb, seq_state)
+                    anchor_state = {
+                        "lstm_h": seq_h.detach().clone(),
+                        "lstm_c": seq_c.detach().clone(),
+                        "done": seq_done,
+                    }
+                    with torch.no_grad():
+                        anchor_logits, _ = reference_policy(seq_mb, anchor_state)
+                else:
+                    current_logits, _ = policy.forward_eval(mb)
+                    with torch.no_grad():
+                        anchor_logits, _ = reference_policy.forward_eval(mb)
                 with torch.no_grad():
-                    anchor_logits, _ = reference_policy.forward_eval(mb)
+                    anchor_probs = F.softmax(anchor_logits.reshape(-1, anchor_logits.shape[-1]), dim=-1)
                 policy_kl_anchor_loss = F.kl_div(
-                    F.log_softmax(current_logits, dim=-1),
-                    F.softmax(anchor_logits, dim=-1),
+                    F.log_softmax(current_logits.reshape(-1, current_logits.shape[-1]), dim=-1),
+                    anchor_probs,
                     reduction="batchmean",
                 )
                 kl_weighted = policy_kl_anchor_loss * args.policy_kl_anchor_coef
@@ -2110,6 +2532,7 @@ def main():
                     safe_action_bonus_min_fill=args.safe_action_bonus_min_fill,
                     safe_action_bonus_fill_weight=args.safe_action_bonus_fill_weight,
                     head_centered=args.head_centered,
+                    num_envs=args.eval_num_envs,
                 )
                 mean_score = stats["mean_score"]
                 win_rate = stats["win_rate"]

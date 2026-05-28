@@ -27,6 +27,9 @@ def main() -> int:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--board-size", type=int, default=20)
     parser.add_argument("--hidden-size", type=int, default=512)
+    parser.add_argument("--early-head-max-fill", type=float, default=None)
+    parser.add_argument("--residual-policy-head", action="store_true")
+    parser.add_argument("--residual-min-fill", type=float, default=None)
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu")
     parser.add_argument("--seed", type=int, default=20001)
     parser.add_argument("--max-steps", type=int, default=100_000)
@@ -35,7 +38,14 @@ def main() -> int:
     parser.add_argument("--delay", type=float, default=0.02, help="seconds to sleep between animated frames")
     args = parser.parse_args()
 
-    policy = SnakeRNNPolicy(board_size=args.board_size, n_channels=5, hidden_size=args.hidden_size).to(args.device)
+    policy = SnakeRNNPolicy(
+        board_size=args.board_size,
+        n_channels=5,
+        hidden_size=args.hidden_size,
+        early_head_max_fill=args.early_head_max_fill,
+        residual_policy_head=args.residual_policy_head,
+        residual_policy_min_fill=args.residual_min_fill,
+    ).to(args.device)
     state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     load_rnn_policy_state(policy, state_dict)
     policy.eval()
@@ -62,7 +72,14 @@ def main() -> int:
     try:
         while not done and step < args.max_steps:
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=args.device).unsqueeze(0)
-            logits, hidden = policy.forward_step(obs_t, hidden)
+            fill_t = None
+            if args.early_head_max_fill is not None or args.residual_min_fill is not None:
+                fill_t = torch.as_tensor(
+                    [env.snake_length / float(args.board_size * args.board_size)],
+                    dtype=torch.float32,
+                    device=args.device,
+                )
+            logits, hidden = policy.forward_step(obs_t, hidden, fill_values=fill_t)
             action = int(torch.argmax(logits, dim=-1).item())
             obs, _, terminated, truncated, info = env.step(action)
             done = terminated or truncated

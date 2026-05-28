@@ -4,7 +4,7 @@
 
 **Perfect Snake** is a reinforcement learning project training AI agents to achieve perfect play on the classic Snake game. The first goal is 100% win rate on a 20x20 grid with a perfect score of 397 (snake fills entire board). The refined goal is a pure neural policy that wins reliably while using fewer steps.
 
-**Current status:** 10x10 solved (100% win rate). 20x20 is solved for the win-rate objective: a pure RNN policy has achieved 100/100 deterministic wins on the benchmark seed slice. The winning policy uses a conservative cycle-like strategy that is path-inefficient, so the active frontier is now preserving win reliability while reducing steps-to-win.
+**Current status:** 10x10 solved (100% win rate). 20x20 is solved on benchmark seed slices by pure RNN policies, but the broad reliability-plus-path-efficiency mission is not complete. The current best reliability frontier is `experiments/broad_anchor_40055_repair_s179_20260507/lr1p00e-04_ep1.pt`: it passed 400/400 on `20001-50100` plus 30/30 hard seeds, but failed 2/200 on `60001-60200` (`60131`, `60146`). Training is paused; the next branch is sequence-level late-failure repair with strict promotion audit.
 
 ## Mission
 
@@ -37,6 +37,9 @@ python experiments.py show exp022
 
 # Evaluate checkpoint
 python eval.py experiments/checkpoint.pt --board-size 20 --episodes 100 --deterministic --device mps
+
+# Audit an RNN checkpoint against deterministic promotion gates
+python rnn_promotion_audit.py experiments/checkpoint.pt --board-size 20 --hidden-size 512 --device mps --ranges 20001:100,30001:100,40001:100,50001:100,60001:200 --hard-seeds 40099,50085,50090,20099,40043,40004,30086,50052,60131,60146 --max-mean-win-steps THRESHOLD --max-p95-win-steps THRESHOLD --out experiments/checkpoint_promotion_audit.json
 ```
 
 ## Code Structure
@@ -113,7 +116,7 @@ perfect_snake/
 | `--eval-every-steps` | 1000000 | Eval every 1M steps (for quick feedback) |
 | `--eval-episodes` | 10 | Episodes per eval (fast but sufficient) |
 
-## Current 20x20 Plateau
+## Historical PPO 20x20 Plateau
 
 Best result: **41% (score 162/397)** - exp056 (ultra-conservative finetune).
 
@@ -135,6 +138,7 @@ Best result: **41% (score 162/397)** - exp056 (ultra-conservative finetune).
 | Board | Best Result | Steps | Experiment |
 |-------|-------------|-------|------------|
 | 10x10 | 100% win | 26M | exp007 |
-| 20x20 | 41% (162/397) | finetune | exp056 |
+| 20x20 PPO | 41% (162/397) | finetune | exp056 |
+| 20x20 RNN | 400/400 broad + 30/30 hard, then 198/200 fresh holdout | ~39.7k mean win steps | broad_anchor_40055_repair_s179 |
 
-**Note:** High variance. Same config can give 0% or 100%. Try multiple seeds.
+**Note:** The PPO section above is historical. The active frontier is now pure RNN reliability repair and path-efficiency auditing.

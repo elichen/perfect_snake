@@ -43,10 +43,13 @@ def _save_json_atomic(payload: Any, path: Path) -> None:
     os.replace(tmp, path)
 
 
-def _selector(stats: dict[str, Any]) -> tuple[float, float, float, float]:
+def _selector(stats: dict[str, Any]) -> tuple[float, ...]:
+    mean_win_steps = stats.get("mean_win_steps")
+    step_term = -float(mean_win_steps) if mean_win_steps is not None else float("-inf")
     return (
         float(stats["win_rate"]),
         float(stats["mean_score"]),
+        step_term,
         float(stats["phase_gte95_rate"]),
         -float(stats["phase_lt20_rate"]),
     )
@@ -70,6 +73,7 @@ def _train_chunk(
     optimizer: torch.optim.Optimizer,
     observations: list[np.ndarray],
     actions: list[int],
+    weights: list[float],
     prev_actions: list[int],
     fill_values: list[float],
     hidden: torch.Tensor,
@@ -80,6 +84,7 @@ def _train_chunk(
 ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, float]]:
     obs_t = torch.as_tensor(np.stack(observations), dtype=torch.float32, device=device).unsqueeze(1)
     act_t = torch.as_tensor(actions, dtype=torch.long, device=device).unsqueeze(1)
+    weight_t = torch.as_tensor(weights, dtype=torch.float32, device=device).unsqueeze(1)
     prev_t = None
     if policy.prev_action_input:
         prev_t = torch.as_tensor(prev_actions, dtype=torch.long, device=device).unsqueeze(1)
@@ -93,7 +98,12 @@ def _train_chunk(
         prev_actions=prev_t,
         fill_values=fill_t,
     )
-    loss = F.cross_entropy(logits.reshape(-1, 3), act_t.reshape(-1))
+    ce_per_step = F.cross_entropy(logits.reshape(-1, 3), act_t.reshape(-1), reduction="none").reshape_as(weight_t)
+    weight_sum = weight_t.sum()
+    if float(weight_sum.item()) > 0.0:
+        loss = (ce_per_step * weight_t).sum() / weight_sum
+    else:
+        loss = logits.sum() * 0.0
     kl_loss = None
     next_anchor_hidden = anchor_hidden
     if anchor_policy is not None and anchor_hidden is not None and kl_anchor_coef > 0.0:
@@ -123,6 +133,7 @@ def _train_chunk(
         "loss": float(loss.item()),
         "kl_loss": None if kl_loss is None else float(kl_loss.item()),
         "accuracy": float(accuracy.item()),
+        "weight_sum": float(weight_sum.item()),
     }
 
 
@@ -139,10 +150,10 @@ def _maybe_eval(
     use_prev_action_input: bool,
     use_fill_input: bool,
     save_path: Path,
-    best: tuple[float, float, float, float] | None,
+    best: tuple[float, ...] | None,
     events: list[dict[str, Any]],
     label: str,
-) -> tuple[tuple[float, float, float, float] | None, dict[str, Any]]:
+) -> tuple[tuple[float, ...] | None, dict[str, Any]]:
     policy.eval()
     stats = evaluate_policy(
         policy,
@@ -181,6 +192,7 @@ def train_episode(
     *,
     policy: SnakeRNNPolicy,
     anchor_policy: SnakeRNNPolicy | None,
+    rollout_policy: SnakeRNNPolicy | None,
     optimizer: torch.optim.Optimizer,
     board_size: int,
     flood_fill: bool,
@@ -194,6 +206,10 @@ def train_episode(
     max_plan_nodes: int,
     max_plan_candidates: int,
     kl_anchor_coef: float,
+    shortcut_score_max: int,
+    teacher_rollout_policy: str,
+    correction_weight: float,
+    teacher_weight: float,
 ) -> dict[str, Any]:
     env = _make_env(
         board_size=board_size,
@@ -207,15 +223,18 @@ def train_episode(
     cycle_index = {pos: idx for idx, pos in enumerate(cycle)}
     hidden = policy.initial_state(1, device)
     anchor_hidden = None if anchor_policy is None else anchor_policy.initial_state(1, device)
+    rollout_hidden = None if rollout_policy is None else rollout_policy.initial_state(1, device)
     prev_action = START_ACTION_TOKEN
 
     obs_buf: list[np.ndarray] = []
     act_buf: list[int] = []
+    weight_buf: list[float] = []
     prev_buf: list[int] = []
     fill_buf: list[float] = []
     chunk_losses: list[float] = []
     chunk_kls: list[float] = []
     chunk_accs: list[float] = []
+    chunk_weights: list[float] = []
     chunks = 0
     done = False
     info: dict[str, Any] = {}
@@ -223,26 +242,53 @@ def train_episode(
 
     while not done and steps < max_steps:
         if teacher_mode == "hamiltonian":
-            action, next_head_idx = expert_action(env, cycle, head_idx)
+            teacher_action, _ = expert_action(env, cycle, head_idx)
         else:
-            action = _teacher_action(
+            teacher_action = _teacher_action(
                 env,
                 cycle,
                 cycle_index,
                 teacher_mode,
                 max_plan_nodes=max_plan_nodes,
                 max_plan_candidates=max_plan_candidates,
+                shortcut_score_max=shortcut_score_max,
             )
-            next_head_idx = cycle_index.get(_target_head_after_action(env, action), head_idx)
+        rollout_action = int(teacher_action)
+        if teacher_rollout_policy == "base":
+            if rollout_policy is None or rollout_hidden is None:
+                raise ValueError("base teacher rollout requires rollout_policy")
+            with torch.no_grad():
+                obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                rollout_prev_t = None
+                if rollout_policy.prev_action_input:
+                    rollout_prev_t = torch.as_tensor([prev_action], dtype=torch.long, device=device)
+                rollout_fill_t = None
+                if rollout_policy.fill_input:
+                    rollout_fill_t = torch.as_tensor(
+                        [env.snake_length / float(board_size * board_size)],
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                rollout_logits, rollout_hidden = rollout_policy.forward_step(
+                    obs_t,
+                    rollout_hidden,
+                    prev_actions=rollout_prev_t,
+                    fill_values=rollout_fill_t,
+                )
+                rollout_action = int(torch.argmax(rollout_logits, dim=-1).item())
+        next_head_idx = cycle_index.get(_target_head_after_action(env, rollout_action), head_idx)
+        is_correction = int(teacher_action) != int(rollout_action)
+        sample_weight = correction_weight if is_correction else teacher_weight
         obs_buf.append(obs.astype(np.float32, copy=True))
-        act_buf.append(int(action))
+        act_buf.append(int(teacher_action))
+        weight_buf.append(float(sample_weight))
         prev_buf.append(int(prev_action))
         fill_buf.append(env.snake_length / float(board_size * board_size))
 
-        obs, _, terminated, truncated, info = env.step(action)
+        obs, _, terminated, truncated, info = env.step(rollout_action)
         done = bool(terminated or truncated)
         head_idx = next_head_idx
-        prev_action = int(action)
+        prev_action = int(rollout_action)
         steps += 1
 
         if len(obs_buf) >= seq_len or done:
@@ -252,6 +298,7 @@ def train_episode(
                 optimizer=optimizer,
                 observations=obs_buf,
                 actions=act_buf,
+                weights=weight_buf,
                 prev_actions=prev_buf,
                 fill_values=fill_buf,
                 hidden=hidden,
@@ -264,9 +311,11 @@ def train_episode(
             if metrics["kl_loss"] is not None:
                 chunk_kls.append(metrics["kl_loss"])
             chunk_accs.append(metrics["accuracy"])
+            chunk_weights.append(metrics["weight_sum"])
             chunks += 1
             obs_buf = []
             act_buf = []
+            weight_buf = []
             prev_buf = []
             fill_buf = []
 
@@ -278,10 +327,12 @@ def train_episode(
         "teacher_score": score,
         "teacher_reason": reason,
         "teacher_steps": steps,
+        "teacher_rollout_policy": teacher_rollout_policy,
         "chunks": chunks,
         "mean_loss": float(np.mean(chunk_losses)) if chunk_losses else 0.0,
         "mean_kl_loss": float(np.mean(chunk_kls)) if chunk_kls else None,
         "mean_accuracy": float(np.mean(chunk_accs)) if chunk_accs else 0.0,
+        "weighted_steps": float(np.sum(chunk_weights)) if chunk_weights else 0.0,
     }
 
 
@@ -306,10 +357,28 @@ def main() -> int:
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--prev-action-input", action="store_true")
     parser.add_argument("--fill-input", action="store_true")
-    parser.add_argument("--teacher-mode", choices=["hamiltonian", "cycle", "grid_path"], default="hamiltonian")
+    parser.add_argument(
+        "--teacher-mode",
+        choices=["hamiltonian", "cycle", "grid_path", "grid_shortest", "tail_path"],
+        default="hamiltonian",
+    )
     parser.add_argument("--max-plan-nodes", type=int, default=2000)
     parser.add_argument("--max-plan-candidates", type=int, default=64)
+    parser.add_argument(
+        "--shortcut-score-max",
+        type=int,
+        default=-1,
+        help="For tail_path teacher only, stop taking shortcuts after this score. Negative disables the cutoff.",
+    )
+    parser.add_argument(
+        "--teacher-rollout-policy",
+        choices=["teacher", "base"],
+        default="teacher",
+        help="Step training episodes with teacher actions, or keep trajectories on the frozen resumed base policy.",
+    )
     parser.add_argument("--kl-anchor-coef", type=float, default=0.0)
+    parser.add_argument("--correction-weight", type=float, default=1.0)
+    parser.add_argument("--teacher-weight", type=float, default=1.0)
     parser.add_argument(
         "--train-policy-head-only",
         action="store_true",
@@ -419,13 +488,34 @@ def main() -> int:
         for name, param in policy.named_parameters():
             param.requires_grad = name.startswith("policy_head")
 
+    rollout_policy = None
+    if args.teacher_rollout_policy == "base":
+        if args.resume is None:
+            raise SystemExit("--teacher-rollout-policy base requires --resume")
+        if anchor_policy is not None:
+            rollout_policy = anchor_policy
+        else:
+            rollout_policy = SnakeRNNPolicy(
+                board_size=args.board_size,
+                n_channels=probe_env.observation_space.shape[0],
+                flood_fill=args.flood_fill,
+                head_centered=args.head_centered,
+                hidden_size=args.hidden_size,
+                prev_action_input=args.prev_action_input,
+                fill_input=args.fill_input,
+            ).to(args.device)
+            load_rnn_policy_state(rollout_policy, torch.load(args.resume, map_location="cpu"))
+            rollout_policy.eval()
+            for param in rollout_policy.parameters():
+                param.requires_grad = False
+
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
     policy.train()
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
     _save_json_atomic({"args": vars(args)}, args.save_path.parent / "run.json")
 
     started = time.time()
-    best: tuple[float, float, float, float] | None = None
+    best: tuple[float, ...] | None = None
     events: list[dict[str, Any]] = []
     train_events: list[dict[str, Any]] = []
 
@@ -452,6 +542,7 @@ def main() -> int:
         event = train_episode(
             policy=policy,
             anchor_policy=anchor_policy,
+            rollout_policy=rollout_policy,
             optimizer=optimizer,
             board_size=args.board_size,
             flood_fill=args.flood_fill,
@@ -465,6 +556,10 @@ def main() -> int:
             max_plan_nodes=max(1, args.max_plan_nodes),
             max_plan_candidates=max(1, args.max_plan_candidates),
             kl_anchor_coef=max(0.0, args.kl_anchor_coef),
+            shortcut_score_max=args.shortcut_score_max,
+            teacher_rollout_policy=args.teacher_rollout_policy,
+            correction_weight=max(0.0, args.correction_weight),
+            teacher_weight=max(0.0, args.teacher_weight),
         )
         event["episode"] = ep_idx
         event["elapsed_sec"] = round(time.time() - started, 1)
@@ -481,6 +576,7 @@ def main() -> int:
                 "mean_loss": round(event["mean_loss"], 6),
                 "mean_kl_loss": None if event["mean_kl_loss"] is None else round(event["mean_kl_loss"], 6),
                 "mean_accuracy": round(event["mean_accuracy"], 4),
+                "weighted_steps": round(event["weighted_steps"], 1),
                 "elapsed_sec": event["elapsed_sec"],
             },
             flush=True,
@@ -507,6 +603,15 @@ def main() -> int:
                     "eval_after_episode": ep_idx,
                     "mean_score": round(float(stats["mean_score"]), 3),
                     "win_rate": round(float(stats["win_rate"]), 4),
+                    "mean_win_steps": None
+                    if stats.get("mean_win_steps") is None
+                    else round(float(stats["mean_win_steps"]), 1),
+                    "p95_win_steps": None
+                    if stats.get("p95_win_steps") is None
+                    else round(float(stats["p95_win_steps"]), 1),
+                    "steps_per_food": None
+                    if stats.get("steps_per_food") is None
+                    else round(float(stats["steps_per_food"]), 3),
                     "phase_lt20_rate": round(float(stats["phase_lt20_rate"]), 4),
                 },
                 flush=True,

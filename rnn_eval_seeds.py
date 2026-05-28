@@ -30,6 +30,7 @@ def eval_seed(
     seed: int,
     device: str,
     max_steps: int,
+    use_fill_values: bool,
 ) -> dict[str, Any]:
     env = SnakeEnv(n=board_size, gamma=0.999, alpha=0.2, seed=seed)
     obs, _ = env.reset(seed=seed)
@@ -37,7 +38,14 @@ def eval_seed(
     info: dict[str, Any] = {}
     for _ in range(max_steps):
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        logits, hidden = policy.forward_step(obs_t, hidden)
+        fill_t = None
+        if use_fill_values:
+            fill_t = torch.as_tensor(
+                [env.snake_length / float(board_size * board_size)],
+                dtype=torch.float32,
+                device=device,
+            )
+        logits, hidden = policy.forward_step(obs_t, hidden, fill_values=fill_t)
         action = int(torch.argmax(logits, dim=-1).item())
         obs, _, terminated, truncated, info = env.step(action)
         if terminated or truncated:
@@ -95,6 +103,7 @@ def main() -> int:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--board-size", type=int, default=20)
     parser.add_argument("--hidden-size", type=int, default=512)
+    parser.add_argument("--early-head-max-fill", type=float, default=None)
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu")
     parser.add_argument("--seed", type=int, default=20001)
     parser.add_argument("--episodes", type=int, default=100)
@@ -105,7 +114,12 @@ def main() -> int:
     args = parser.parse_args()
 
     seeds = args.seeds if args.seeds is not None else list(range(args.seed, args.seed + args.episodes))
-    policy = SnakeRNNPolicy(board_size=args.board_size, n_channels=5, hidden_size=args.hidden_size).to(args.device)
+    policy = SnakeRNNPolicy(
+        board_size=args.board_size,
+        n_channels=5,
+        hidden_size=args.hidden_size,
+        early_head_max_fill=args.early_head_max_fill,
+    ).to(args.device)
     load_rnn_policy_state(policy, torch.load(args.checkpoint, map_location="cpu"))
     policy.eval()
 
@@ -118,6 +132,7 @@ def main() -> int:
             seed=seed,
             device=args.device,
             max_steps=args.max_steps,
+            use_fill_values=args.early_head_max_fill is not None,
         )
         results.append(result)
         if not result["win"]:

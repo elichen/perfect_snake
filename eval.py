@@ -173,6 +173,161 @@ class SnakePolicy(nn.Module):
         return logits, values
 
 
+class SnakeRecurrentPPOPolicy(nn.Module):
+    """LSTM policy for recurrent PPO checkpoints."""
+
+    def __init__(
+        self,
+        board_size: int,
+        scale: int = 1,
+        n_channels: int = 5,
+        hidden_size: int = 256,
+        embed_size: int | None = None,
+        head_centered: bool = False,
+        full_ff_encoder: bool = False,
+        residual_recurrent: bool = False,
+    ):
+        super().__init__()
+
+        self.encoder_channels = n_channels
+        self.hidden_size = int(hidden_size)
+        self.board_size = board_size
+        self.head_centered = head_centered
+        self.full_ff_encoder = bool(full_ff_encoder)
+        self.residual_recurrent = bool(residual_recurrent)
+
+        if head_centered:
+            obs_n = 2 * (board_size - 1) + 1
+        else:
+            obs_n = board_size + 2
+        self.obs_shape = (n_channels, obs_n, obs_n)
+        n_input = int(np.prod(self.obs_shape))
+
+        if embed_size is None:
+            embed_size = 256 if scale <= 1 else 512
+        trunk = 1024 if scale <= 1 else 2048
+        if scale >= 4:
+            trunk = 4096
+
+        if self.full_ff_encoder:
+            w = [1024, 512, 256, 128]
+            if scale == 2:
+                w = [2048, 1024, 512, 256]
+            elif scale == 4:
+                w = [4096, 2048, 1024, 512]
+            recurrent_input_size = w[-1]
+            self.encoder = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(n_input, w[0]),
+                nn.LayerNorm(w[0]),
+                nn.ReLU(),
+                nn.Linear(w[0], w[1]),
+                nn.LayerNorm(w[1]),
+                nn.ReLU(),
+                nn.Linear(w[1], w[2]),
+                nn.LayerNorm(w[2]),
+                nn.ReLU(),
+                nn.Linear(w[2], w[3]),
+                nn.ReLU(),
+            )
+        else:
+            recurrent_input_size = int(embed_size)
+            self.encoder = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(n_input, trunk),
+                nn.LayerNorm(trunk),
+                nn.ReLU(),
+                nn.Linear(trunk, int(embed_size)),
+                nn.LayerNorm(int(embed_size)),
+                nn.ReLU(),
+            )
+        if self.residual_recurrent and recurrent_input_size != self.hidden_size:
+            raise ValueError("--recurrent-residual requires recurrent input size to match hidden size")
+
+        self.lstm = nn.LSTM(recurrent_input_size, self.hidden_size)
+        self.cell = nn.LSTMCell(recurrent_input_size, self.hidden_size)
+        self.cell.weight_ih = self.lstm.weight_ih_l0
+        self.cell.weight_hh = self.lstm.weight_hh_l0
+        self.cell.bias_ih = self.lstm.bias_ih_l0
+        self.cell.bias_hh = self.lstm.bias_hh_l0
+
+        self.policy_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size // 2, 3),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size // 2, 1),
+        )
+
+    def initial_state(self, batch_size: int, device: str | torch.device) -> dict[str, torch.Tensor]:
+        return {
+            "lstm_h": torch.zeros(batch_size, self.hidden_size, device=device),
+            "lstm_c": torch.zeros(batch_size, self.hidden_size, device=device),
+        }
+
+    def _state_tensors(
+        self,
+        state: dict | None,
+        batch_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if state is None or state.get("lstm_h") is None or state.get("lstm_c") is None:
+            zeros = self.initial_state(batch_size, device)
+            return zeros["lstm_h"], zeros["lstm_c"]
+        h = state["lstm_h"]
+        c = state["lstm_c"]
+        if h.ndim == 3:
+            h = h.squeeze(0)
+        if c.ndim == 3:
+            c = c.squeeze(0)
+        return h, c
+
+    def _encode_flat(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.encoder(observations[:, :self.encoder_channels])
+
+    def _decode(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.policy_head(hidden), self.value_head(hidden)
+
+    def forward_eval(self, observations, state=None):
+        batch_size = observations.shape[0]
+        encoded = self._encode_flat(observations)
+        h, c = self._state_tensors(state, batch_size, observations.device)
+        h, c = self.cell(encoded, (h, c))
+        if state is not None:
+            state["lstm_h"] = h.detach()
+            state["lstm_c"] = c.detach()
+        features = encoded + h if self.residual_recurrent else h
+        return self._decode(features)
+
+    def forward(self, observations, state=None):
+        obs_dims = len(self.obs_shape)
+        if observations.ndim == obs_dims + 1:
+            return self.forward_eval(observations, state)
+        if observations.ndim != obs_dims + 2:
+            raise ValueError(f"invalid observation shape: {tuple(observations.shape)}")
+
+        batch_size, timesteps = observations.shape[:2]
+        flat_obs = observations.reshape(batch_size * timesteps, *self.obs_shape)
+        encoded = self._encode_flat(flat_obs).reshape(batch_size, timesteps, -1)
+        encoded = encoded.transpose(0, 1)
+        h, c = self._state_tensors(state, batch_size, observations.device)
+        outputs, (h_n, c_n) = self.lstm(encoded, (h.unsqueeze(0), c.unsqueeze(0)))
+        outputs = outputs.transpose(0, 1)
+        if self.residual_recurrent:
+            outputs = outputs + encoded.transpose(0, 1)
+        outputs = outputs.reshape(batch_size * timesteps, self.hidden_size)
+        logits, values = self._decode(outputs)
+        if state is not None:
+            state["lstm_h"] = h_n.detach()
+            state["lstm_c"] = c_n.detach()
+        return logits, values.reshape(batch_size, timesteps)
+
+
 class IterativeBlock(nn.Module):
     """Weight-tied convolutional block (must match train.py)."""
 
@@ -390,6 +545,11 @@ def evaluate_checkpoint(
     action_history_obs: int = 0,
     iterative_cnn: bool = False,
     n_iterations: int = 12,
+    recurrent: bool = False,
+    recurrent_hidden_size: int = 256,
+    recurrent_embed_size: int = 0,
+    recurrent_full_ff_encoder: bool = False,
+    recurrent_residual: bool = False,
     aux_flood_fill: bool = False,
     aux_cycle_target: bool = False,
     aux_tail_target: bool = False,
@@ -425,7 +585,29 @@ def evaluate_checkpoint(
     )
     state_dict = torch.load(checkpoint_path, map_location=device)
 
-    if iterative_cnn:
+    if recurrent:
+        if iterative_cnn:
+            raise ValueError("recurrent evaluation cannot be combined with iterative_cnn")
+        policy = SnakeRecurrentPPOPolicy(
+            board_size=board_size,
+            scale=network_scale,
+            n_channels=n_channels,
+            hidden_size=recurrent_hidden_size,
+            embed_size=(recurrent_embed_size or None),
+            head_centered=head_centered,
+            full_ff_encoder=recurrent_full_ff_encoder,
+            residual_recurrent=recurrent_residual,
+        ).to(device)
+        _load_policy_state(
+            policy,
+            state_dict,
+            aux_flood_fill=False,
+            aux_cycle_target=False,
+            aux_tail_target=False,
+            aux_body_age_target=False,
+            late_head_min_fill=None,
+        )
+    elif iterative_cnn:
         policy = SnakeIterativeCNNPolicy(
             board_size=board_size, scale=network_scale, n_channels=n_channels,
             n_iterations=n_iterations, aux_flood_fill=aux_flood_fill,
@@ -501,13 +683,17 @@ def evaluate_checkpoint(
 
         for ep in range(episodes):
             obs, info = env.reset(seed=seed + ep)
+            state = policy.initial_state(1, device) if recurrent else None
             done = False
             last_info = info
             steps = 0
 
             while not done:
                 obs_t = torch.as_tensor(obs, device=device, dtype=torch.float32).unsqueeze(0)
-                logits, _ = policy(obs_t)
+                if recurrent:
+                    logits, _ = policy.forward_eval(obs_t, state)
+                else:
+                    logits, _ = policy(obs_t)
                 if deterministic:
                     action = int(torch.argmax(logits, dim=-1).item())
                 else:
@@ -538,6 +724,7 @@ def evaluate_checkpoint(
         obs_batch = []
         episode_steps = []
         next_seed = seed
+        recurrent_state = policy.initial_state(active_slots, device) if recurrent else None
 
         for _ in range(active_slots):
             env = SnakeEnv(
@@ -576,7 +763,16 @@ def evaluate_checkpoint(
             active_indices = [i for i, obs in enumerate(obs_batch) if obs is not None]
             batch_obs = np.stack([obs_batch[i] for i in active_indices]).astype(np.float32)
             obs_t = torch.as_tensor(batch_obs, device=device, dtype=torch.float32)
-            logits, _ = policy(obs_t)
+            if recurrent:
+                state = {
+                    "lstm_h": recurrent_state["lstm_h"][active_indices],
+                    "lstm_c": recurrent_state["lstm_c"][active_indices],
+                }
+                logits, _ = policy.forward_eval(obs_t, state)
+                recurrent_state["lstm_h"][active_indices] = state["lstm_h"]
+                recurrent_state["lstm_c"][active_indices] = state["lstm_c"]
+            else:
+                logits, _ = policy(obs_t)
             if deterministic:
                 batch_actions = torch.argmax(logits, dim=-1).cpu().numpy()
             else:
@@ -606,6 +802,9 @@ def evaluate_checkpoint(
                     obs, _ = envs[slot].reset(seed=next_seed)
                     next_seed += 1
                     episode_steps[slot] = 0
+                    if recurrent:
+                        recurrent_state["lstm_h"][slot].zero_()
+                        recurrent_state["lstm_c"][slot].zero_()
 
                 obs_batch[slot] = obs
 
@@ -670,6 +869,11 @@ def main():
     parser.add_argument("--action-history-obs", type=int, default=0, help="Number of previous relative actions to encode as one-hot broadcast planes")
     parser.add_argument("--iterative-cnn", action="store_true", help="Use iterative CNN policy")
     parser.add_argument("--n-iterations", type=int, default=12, help="Iterations for iterative CNN")
+    parser.add_argument("--recurrent", action="store_true", help="Use recurrent PPO LSTM policy")
+    parser.add_argument("--recurrent-hidden-size", type=int, default=256, help="Hidden size for --recurrent policy")
+    parser.add_argument("--recurrent-embed-size", type=int, default=0, help="Encoder size for --recurrent policy (0 = scale default)")
+    parser.add_argument("--recurrent-full-ff-encoder", action="store_true", help="Use the feed-forward PPO trunk before the recurrent adapter")
+    parser.add_argument("--recurrent-residual", action="store_true", help="Add LSTM output as a residual correction to encoder features")
     parser.add_argument("--aux-flood-fill", action="store_true", help="Model was trained with aux flood-fill decoder")
     parser.add_argument("--aux-cycle-target", action="store_true", help="Model was trained with auxiliary curriculum cycle target decoder")
     parser.add_argument("--aux-tail-target", action="store_true", help="Model was trained with auxiliary tail target decoder")
@@ -711,6 +915,11 @@ def main():
             action_history_obs=args.action_history_obs,
             iterative_cnn=args.iterative_cnn,
             n_iterations=args.n_iterations,
+            recurrent=args.recurrent,
+            recurrent_hidden_size=args.recurrent_hidden_size,
+            recurrent_embed_size=args.recurrent_embed_size,
+            recurrent_full_ff_encoder=args.recurrent_full_ff_encoder,
+            recurrent_residual=args.recurrent_residual,
             aux_flood_fill=args.aux_flood_fill,
             aux_cycle_target=args.aux_cycle_target,
             aux_tail_target=args.aux_tail_target,

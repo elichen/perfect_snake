@@ -23,6 +23,8 @@ class SnakeRNNPolicy(nn.Module):
         fill_input: bool = False,
         future_action_horizon: int = 0,
         early_head_max_fill: float | None = None,
+        residual_policy_head: bool = False,
+        residual_policy_min_fill: float | None = None,
     ):
         super().__init__()
         total_channels = n_channels
@@ -33,6 +35,8 @@ class SnakeRNNPolicy(nn.Module):
         self.prev_action_vocab = 4
         self.future_action_horizon = future_action_horizon
         self.early_head_max_fill = early_head_max_fill
+        self.residual_policy_head_enabled = residual_policy_head
+        self.residual_policy_min_fill = residual_policy_min_fill
 
         if head_centered:
             obs_n = 2 * (board_size - 1) + 1
@@ -67,6 +71,12 @@ class SnakeRNNPolicy(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_size // 2, 3),
             )
+        if residual_policy_head:
+            self.residual_policy_head = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size // 2),
+                nn.ReLU(),
+                nn.Linear(hidden_size // 2, 3),
+            )
         if future_action_horizon > 0:
             self.future_action_head = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size // 2),
@@ -74,6 +84,7 @@ class SnakeRNNPolicy(nn.Module):
                 nn.Linear(hidden_size // 2, future_action_horizon * 3),
             )
         self._sync_early_head_from_base()
+        self._zero_residual_head()
 
     def initial_state(self, batch_size: int, device: str | torch.device):
         return torch.zeros(batch_size, self.hidden_size, device=device)
@@ -82,6 +93,13 @@ class SnakeRNNPolicy(nn.Module):
         if self.early_head_max_fill is None:
             return
         self.early_policy_head.load_state_dict(self.policy_head.state_dict())
+
+    def _zero_residual_head(self) -> None:
+        if not self.residual_policy_head_enabled:
+            return
+        final = self.residual_policy_head[-1]
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
 
     def _augment_encoded(self, encoded, prev_actions=None, fill_values=None):
         pieces = [encoded]
@@ -129,6 +147,13 @@ class SnakeRNNPolicy(nn.Module):
                 early_logits = self.early_policy_head(outputs_t[early_mask])
                 logits = logits.clone()
                 logits[early_mask] = early_logits
+        if self.residual_policy_head_enabled:
+            residual = self.residual_policy_head(outputs_t.reshape(t * b, -1)).reshape(t, b, 3)
+            if self.residual_policy_min_fill is not None:
+                if fill_values is None:
+                    raise ValueError("fill_values is required when residual_policy_min_fill is set")
+                residual = residual * (fill_values >= self.residual_policy_min_fill).unsqueeze(-1)
+            logits = logits + residual
         if return_features:
             return logits, hidden, outputs_t
         return logits, hidden
@@ -150,6 +175,13 @@ class SnakeRNNPolicy(nn.Module):
                 early_logits = self.early_policy_head(hidden[early_mask])
                 logits = logits.clone()
                 logits[early_mask] = early_logits
+        if self.residual_policy_head_enabled:
+            residual = self.residual_policy_head(hidden)
+            if self.residual_policy_min_fill is not None:
+                if fill_values is None:
+                    raise ValueError("fill_values is required when residual_policy_min_fill is set")
+                residual = residual * (fill_values >= self.residual_policy_min_fill).unsqueeze(-1)
+            logits = logits + residual
         return logits, hidden
 
     def forward_future_logits(self, hidden_states):
@@ -179,6 +211,13 @@ def load_rnn_policy_state(policy: nn.Module, state_dict: dict[str, torch.Tensor]
             "early_policy_head.2.weight",
             "early_policy_head.2.bias",
         })
+    if getattr(policy, "residual_policy_head_enabled", False):
+        allowed_missing.update({
+            "residual_policy_head.0.weight",
+            "residual_policy_head.0.bias",
+            "residual_policy_head.2.weight",
+            "residual_policy_head.2.bias",
+        })
     if unexpected or any(key not in allowed_missing for key in missing):
         raise RuntimeError(
             f"Error(s) in loading state_dict: missing={missing} unexpected={unexpected}"
@@ -187,6 +226,10 @@ def load_rnn_policy_state(policy: nn.Module, state_dict: dict[str, torch.Tensor]
         sync_early = getattr(policy, "_sync_early_head_from_base", None)
         if callable(sync_early):
             sync_early()
+    if getattr(policy, "residual_policy_head_enabled", False) and any(key.startswith("residual_policy_head") for key in missing):
+        zero_residual = getattr(policy, "_zero_residual_head", None)
+        if callable(zero_residual):
+            zero_residual()
 
 
 def freeze_except_early_head(policy: nn.Module) -> None:

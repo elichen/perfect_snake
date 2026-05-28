@@ -489,3 +489,118 @@ At 94% eval (exp072), deaths are:
 2. **Reduce early blunders** - 18% of episodes fail before 20% fill
 3. **Better endgame planning** - Search-augmented play (MCTS) at 80%+ fill
 4. **Longer training** - exp072 still improving at 500M steps
+
+---
+
+## 2026-05-05 Path-Efficient RNN Follow-up
+
+The win-rate objective is now solved by a pure RNN policy, but its strategy is cycle-like and path-inefficient. Current path-efficiency baseline is:
+
+- `experiments/shortcut_base_label_strong_s114c_20260505T120413/lr3p00e-07_ep10.pt`
+- 15-seed gate: 15/15 wins, mean_win_steps=39648.73, p95_win_steps=40974.4, steps_per_food=99.87
+
+Sequence-level shortcut BC was tested to see whether recurrent/full-model updates can absorb train-time path-planner labels better than frozen-hidden policy-head patches. All inference remained pure neural network, with no planner/search/rule fallback at eval.
+
+Results:
+
+- `rnn_online_grid_path_seq_s117_20260505T160559`: full grid-path teacher rollout, lr=1e-7, KL=0.1. Failed the hard gate at 14/15 wins; seed 20100 died at score 395 in an exact rerun.
+- `rnn_online_tail_base_seq_s118_20260505T162619`: base rollout, tail-path labels through score 200, lr=3e-8, KL=0.5. Preserved 15/15 but worsened mean_win_steps to 39697.0.
+- `rnn_online_grid_base_seq_s119_20260505T163626`: base rollout, grid-path labels, lr=3e-8, KL=0.5. Failed hard gate at 12/15 wins.
+- `rnn_online_tail_base_corrections_s120_20260505T164700`: base rollout, tail-path correction-only CE, lr=1e-8, KL=1.0. Preserved 15/15 but was an exact no-op on the gate: mean_win_steps=39648.73.
+- `rnn_online_tail_base_corrections_s121_20260505T165623`: same correction-only setup with lr=3e-8. Preserved 15/15 but worsened mean_win_steps to 39697.0.
+- `rnn_teacher_eval.py` was added to evaluate train-time shortcut teachers directly. On seeds 30034,20008,30014,20100,30023, `grid_path` won 5/5 with mean_win_steps=38001.2, while `tail_path --shortcut-score-max 200` failed 0/5 by stalling near score 201.
+- `rnn_online_grid_full_low_s122_20260505T171103` and `rnn_online_grid_full_low_s123_20260505T171936`: full grid-path teacher rollout with KL=1.0 at lr=1e-8 and 3e-8. Both preserved 15/15 but were exact no-ops on the gate: mean_win_steps=39648.73.
+- `rnn_online_grid_full_low_s124_20260505T172804`: full grid-path teacher rollout with lr=1e-7, KL=1.0. Broke the gate at 14/15 and worsened mean_win_steps among wins to 39736.5.
+- `rnn_online_grid_scratch_s125_20260505T173632`: scratch online RNN distillation from grid-path teacher for 12 full teacher episodes. Teacher trajectories all won in 35.6k-39.3k steps and training action accuracy reached ~90%, but greedy eval stayed 0/5; seed 30034 died by wall at score 0 after 10 steps. Simple online BC from the shorter teacher is therefore insufficient.
+- `distill.train_bc_rnn` was extended with `--teacher-mode`, `--max-episode-steps`, and shortcut planner arguments so replay-based RNN BC can train on full grid-path trajectories.
+- `rnn_grid_replay_s126_20260505T174601`: replay BC from two full grid-path trajectories, 500 train steps. Sampled-window accuracy reached 94.3%, but greedy eval stayed 0/5; seed 30034 stalled at score 0 after 801 steps.
+- `rnn_grid_replay_dagger_s127_20260505T174754`: same replay setup plus one DAgger round on student stall states. Accuracy reached 96.6%, but short eval stayed mean_score=0.2, win_rate=0.0 and hit the hard-kill criterion.
+- `rnn_stochastic_harvest.py` was added to sample stochastic pure-policy rollouts near the winning RNN. On seed 30034, epsilon perturbations of 0.0001-0.0003 through score 200 produced 0/10 wins, usually dying early; random exploration is too destructive.
+- `rnn_single_deviation_scan.py` found a stronger action-space signal. For seed 30034, forcing one alternate first action and then returning to greedy policy still won, improving 41596 -> 39883 or 39717 steps. A full step-0 scan across the 15-seed gate found 14 improved seed/action pairs, with best single-seed improvement 2458 steps.
+- `rnn_targeted_action_patch.py` was added to train policy-head patches from harvested action trajectories plus anchors. A one-seed target-heavy probe improved seed 30034 to 38488 steps, but failed the broad gate by killing seed 30085 at score 36.
+- `targeted_action_patch_multiseed_s134_20260506`: trained on the best step-0 improvement for every improved gate seed plus anchors for non-improved seeds. Weak settings preserved 15/15 but worsened mean_win_steps to 39983.4; stronger settings flipped some target actions but broke the hard gate.
+- `rnn_early_head_patch.py` was added to train only the model's low-fill `early_policy_head`, leaving the base RNN and main policy head frozen. This keeps inference pure neural while localizing changes to length-3 initial-food behavior.
+- `early_head_step0_s135_20260506/lr1p00e-03_ep1.pt` is the new path-efficiency frontier. It uses `early_head_max_fill=0.01`, passed the 15-seed gate at 15/15 with mean_win_steps=39582.8, and passed both 100-seed broad suites:
+  - `20001-20100`: 100/100 wins, mean_win_steps=39830.03, p95_win_steps=41600.05.
+  - `30001-30100`: 100/100 wins, mean_win_steps=39605.95, p95_win_steps=41546.6.
+  - Combined broad mean: 39717.99 steps, improving the previous `shortcut_base_label_strong_s114c` combined mean of about 39795.32 by about 77.33 steps while preserving 200/200 deterministic wins.
+- `single_deviation_s138_20260506/early_head_gate_lowfill_stride50.json` scanned the new early-head frontier for post-step-0 low-fill deviations. It found 8 genuine step-50 improvements, with best improvement 1379 steps on seed 20064.
+- `early_head_step50_s139_20260506`: trained a second-round early head from those step-50 deviations. The best candidate preserved 15/15 but had mean_win_steps=39621.33, worse than the promoted `s135` frontier, so this second-round target set is not promoted.
+- `single_deviation_s140_20260506/early_head_gate_score1_stride50.json` scanned length-4 / score-1 low-fill deviations and found 5 apparent improvements, including a 3893-step single-seed improvement on seed 30005.
+- `early_head_score1_s141_20260506`: trained a wider early head with `early_head_max_fill=0.0126` from those score-1 deviations. The best small-gate candidate (`lr3p00e-04_ep1.pt`) improved the 15-seed gate to mean_win_steps=39512.27, but failed broad promotion: it preserved 200/200 wins with mean_win_steps=39826.71 on `20001-20100` and 39692.65 on `30001-30100`, for a combined mean of 39759.68. This is 41.69 steps worse than the `s135` frontier, so it is not promoted.
+- `rnn_eval_seeds_batch.py` was added after sequential broad validation became too slow. It batches policy forward passes across exact seeds while keeping the same greedy RNN inference and independent `SnakeEnv` state transitions. A sanity check on seeds 30034 and 20008 matched the recorded gate step counts exactly.
+
+Conclusion: global BC-style path-efficiency patches were not promotable, but a localized low-fill neural head can safely shift initial-food behavior and improve broad-suite path efficiency. The next branch should iterate from `early_head_step0_s135_20260506/lr1p00e-03_ep1.pt`, using the same 200-seed broad validation gate before promotion.
+
+## 2026-05-06 Reliability Audit And Late-Failure Patch Attempts
+
+The 200-seed broad gate was not enough to certify the refined mission. A fresh holdout check on `40001-40100` and `50001-50100` found that `early_head_step0_s135_20260506/lr1p00e-03_ep1.pt` and `early_head_broad_step0_top25_steponly_w50_s146_20260506/lr1p00e-04_ep1.pt` both score 197/200, failing the same three seeds: `40004`, `40014`, and `40099`. The pre-early-head clean RNN `shortcut_base_label_strong_s114c_20260505T120413/lr3p00e-07_ep10.pt` scores 196/200 on the same holdout, failing `40004`, `40055`, `40099`, and `50052`. The project is therefore not done under the reliability wording of `/goal`; the current best result is benchmark-slice mastery, not broad deterministic reliability.
+
+`rnn_initial_action_scan_batch.py` was added to batch forced-initial-action scans. On the `s135` 200-seed broad suite, it found 118/200 seeds with at least one step-0 action improvement, with best single-seed improvement of 5079 steps. However, follow-up early-head training did not promote:
+
+- `early_head_broad_step0_s143_20260506`: trained from all 118 broad step-0 improvements. Best result preserved 200/200 but had mean_win_steps=39748.54, worse than the `s135` mean of 39717.99.
+- `early_head_broad_step0_top25_s144_20260506`: trained from the top 25 step-0 improvements. Best result preserved 200/200 but had mean_win_steps=39749.70, also worse than `s135`.
+- `early_head_broad_step0_top25_steponly_s145_20260506`: step-0-only high-weight CE failed immediately on broad seeds.
+- `early_head_broad_step0_top25_steponly_w50_s146_20260506`: lower-weight step-0-only CE technically improved the 200-seed in-slice mean to 39715.95 while preserving 200/200, but holdout validation stayed 197/200. This is not a reliability promotion.
+
+The holdout failures are not irrecoverable by the base policy dynamics. `rnn_single_deviation_scan.py` found one-action winning continuations for all three `s135` holdout failures: `40004` needs action 0 instead of 1 at step 39782, `40014` needs action 2 instead of 1 at step 41800, and `40099` needs action 0 instead of 1 at step 42182. These are training-only labels; no inference-time deviation rule is allowed.
+
+Late policy-head patching was tested and is currently falsified as a reliable route:
+
+- `late_failfix_s149_20260506`: sparse terminal corrections plus sparse anchors. Low LR did not fix `40004`; medium LR fixed the target but introduced a new failure on `30086`; higher LR collapsed early.
+- `late_failfix_dense_anchor_s150_20260506`: dense anchors on newly regressed seeds `30086` and `40043`. Low LR still missed `40004`; stronger settings caused early collapses.
+- `late_failfix_traj_s151_20260506`: sampled the full winning deviation trajectories every 20 steps. Below the correction threshold it still missed `40004`; above the threshold it again introduced `30086` or early failures.
+
+A hard-seed checkpoint scan over the relevant shortcut/early-head chain was saved to `experiments/hard_seed_checkpoint_scan_20260506.json`. No candidate cleared the discovered hard set `40004,40014,40099,40055,50052,30086,40043,20008`; best candidates reached only 5/8.
+
+Conclusion: the current frontier remains `early_head_step0_s135_20260506/lr1p00e-03_ep1.pt` for broad path efficiency, but mission progress should now prioritize reliability on fresh deterministic seed suites. Single-action CE surgery has a real signal but is too brittle. The next defensible branch should use sequence-level or trust-region training on failure-conditioned late-game states, with a promotion gate that includes `20001-20100`, `30001-30100`, `40001-40100`, `50001-50100`, and the hard-seed set.
+
+## 2026-05-15 Pause-State Reliability Audit
+
+Training is paused. The active mission is still not complete under the refined reliability-plus-path-efficiency goal: a pure neural 20x20 policy must score 397/397 in deterministic greedy inference with no planner/search/rule fallback, and any path-efficiency gain must preserve 100% win rate on broad deterministic suites.
+
+The strongest broad reliability candidate found in the later repair chain is currently `experiments/broad_anchor_40055_repair_s179_20260507/lr1p00e-04_ep1.pt`. It passed `20001-20100`, `30001-30100`, `40001-40100`, and `50001-50100` at 400/400 wins with mean_win_steps=39748.59, and also passed the 30-seed hard set at 30/30 wins with mean_win_steps=39699.17. It is not a completion candidate because the fresh `60001-60200` holdout was only 198/200, failing `60131` at score 396 and `60146` at score 393.
+
+The exact-point repair candidate `experiments/exact_point_40043_repair_s172_20260507/lr1p00e-04_ep1.pt` passed its 29-seed hard audit, but a stop-on-first-failure broad audit from `20001` found a regression at seed `20250`: score 391, self-collision, step 38411. A one-action scan showed this failure is locally recoverable by taking action 2 instead of the policy's action 1 at step 38410, score 391; the greedy continuation then wins at step 38421. The saved label is `experiments/single_deviation_20250_s187_20260515/exact_point_s172_seed20250_step38410.json`.
+
+Conclusion: the completion audit fails. The best known candidate is `broad_anchor_40055_repair_s179`, not the later exact-point repair, but it still has late holdout failures. The next resume-worthy branch should avoid another isolated point patch unless it is wrapped in broad sequence-level/trust-region anchoring. A concrete next experiment is sequence-level late-failure repair from `broad_anchor_40055_repair_s179/lr1p00e-04_ep1.pt` using targets for `60131` and `60146`, plus hard anchors including `40099`, `50085`, `50090`, `20099`, `40043`, `40004`, `30086`, `50052`, and the broad 20001-50100 suites. Promotion must require 600/600 wins on `20001-20100`, `30001-30100`, `40001-40100`, `50001-50100`, `60001-60200`, and no hard-set regressions.
+
+`rnn_sequence_repair.py` was added as the resume-ready tool for that branch. Unlike `rnn_targeted_action_patch.py`, it trains through `forward_sequence` on fixed late-failure BPTT windows and applies a frozen-reference KL on broad anchor windows, so it is a sequence-level/trust-region repair rather than a cached-hidden-state head patch. The window packer was corrected to place real transitions at the beginning of short windows, not after left-padding, so padded timesteps cannot corrupt the recurrent state before useful context. A collect-only smoke test wrote `experiments/seq_repair_smoke_s188_20260515_anchor3/dataset_summary.json` and verified the intended data path: target windows for `60131` and `60146`, plus a fallback high-fill anchor window for `40099`. A tiny synthetic CPU smoke exercised `_train_sequence_candidate` on one random window and completed with finite CE/KL metrics, verifying the train loop shape/gradient path without launching a real Snake training run. No training run was launched during the pause.
+
+Resume command template:
+
+```bash
+python -u rnn_sequence_repair.py \
+  --base experiments/broad_anchor_40055_repair_s179_20260507/lr1p00e-04_ep1.pt \
+  --trajectory-json experiments/final_layer_60131_60146_s184_20260508/points.json \
+  --out-dir experiments/seq_repair_60131_60146_s188_20260515 \
+  --board-size 20 --hidden-size 512 --device mps \
+  --anchor-ranges 20001:100,30001:100,40001:100,50001:100 \
+  --anchor-seeds 40099,50085,50090,20099,40043,40004,30086,50052 \
+  --gate-seeds 60131,60146,40099,50085,50090,20099,40043,40004,30086,50052 \
+  --lrs 1e-7,3e-7,1e-6 --epochs 1,2,4 \
+  --window-len 544 --target-context-before 512 --target-context-after 32 \
+  --anchor-stride 1000 --anchor-min-fill 0.9 --max-anchor-windows 400 \
+  --target-weight 50 --trajectory-weight 0.1 --anchor-weight 0.1 \
+  --trajectory-kl-weight 0.1 --anchor-kl-weight 1.0 --kl-coef 2.0 \
+  --batch-size 8 --fail-fast --save-all
+```
+
+`rnn_promotion_audit.py` was added to turn the refined goal into a repeatable completion check. It runs deterministic greedy RNN inference only, writes per-suite and combined summaries, and emits a checklist covering pure neural inference, no planner/search/rule fallback, required perfect score, evaluated episode count, reliability pass/fail, optional mean/p95 win-step path-efficiency gates, and promotion pass/fail. A smoke audit on `broad_anchor_40055_repair_s179/lr1p00e-04_ep1.pt` with `good=40099:1,known_fail=60131:1` wrote `experiments/promotion_audit_smoke_s188_20260515.json`; it correctly passed `40099`, failed `60131` at score 396, and marked `promotion_passed=false`. A second path-gate smoke wrote `experiments/promotion_audit_pathgate_smoke_s188_20260515.json`; it passed reliability on `40099` but failed an intentionally strict `--max-mean-win-steps 39000` threshold, confirming that path efficiency can block promotion separately from win rate.
+
+A current machine-readable completion audit was written to `experiments/current_completion_audit_20260515.json`. It records the objective, current frontier evidence, the `60131`/`60146` reliability gap, and the exact next action when training resumes. The tracked conclusion remains unchanged: status is `not_complete`.
+
+Three bounded sequence-repair pilots were run from `broad_anchor_40055_repair_s179/lr1p00e-04_ep1.pt` using the `60131`/`60146` labels. `seq_repair_60131_60146_s188_pilot_20260515` used broad mini-anchors, target_weight=50, and kl_coef=2.0. Its best candidate was `lr3p00e-07_ep2.pt`: it fixed `60131` and preserved the hard anchors, but still failed `60146` at score 389, so it is not promoted. `seq_repair_60131_60146_s189_strongtarget_hard_20260515` increased target pressure to 150 with hard anchors only. This was worse: candidates fixed `60131` but regressed hard seeds such as `40043`, `40004`, or collapsed `50090` early. `seq_repair_60131_60146_s190_residual_hard_20260515` added a zero-initialized residual-head-only mode to localize updates. Safe residual settings preserved anchors but did not fix `60131`; the strongest setting regressed `40004`. Conclusion: the labels are real, but both stronger point pressure and residual-only locality are insufficient as currently configured. The next adjustment should not simply increase CE; it should use denser late-game anchors around `40043`/`40004`/`50090`, try a 60146-focused trust-region repair, or switch to a richer sequence objective that preserves pre-deviation behavior while changing only the terminal branch.
+
+Promotion audit template:
+
+```bash
+python -u rnn_promotion_audit.py \
+  experiments/<candidate>.pt \
+  --board-size 20 --hidden-size 512 --device mps \
+  --ranges 20001:100,30001:100,40001:100,50001:100,60001:200 \
+  --hard-seeds 40099,50085,50090,20099,40043,40004,30086,50052,60131,60146 \
+  --max-mean-win-steps <threshold> --max-p95-win-steps <threshold> \
+  --max-steps 100000 --stop-after-failures 1 \
+  --out experiments/<candidate>_promotion_audit.json
+```
