@@ -830,7 +830,7 @@ def main() -> None:
     parser.add_argument("--safe-target-temperature", type=float, default=50.0)
     parser.add_argument(
         "--teacher-mode",
-        choices=["hamiltonian", "cycle", "grid_shortest", "grid_path", "tail_path"],
+        choices=["hamiltonian", "cycle", "safe", "grid_shortest", "grid_path", "tail_path"],
         default="hamiltonian",
     )
     parser.add_argument(

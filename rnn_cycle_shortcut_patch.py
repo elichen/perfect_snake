@@ -409,6 +409,13 @@ def _teacher_action(
         return _grid_shortest_teacher_action(env, cycle, cycle_index)
     if teacher_mode == "cycle":
         return _cycle_shortcut_teacher_action(env, cycle, cycle_index)
+    if teacher_mode == "safe":
+        # Tapsell-style safe shortcut, disabled past ~50% fill (see safe_teacher.py).
+        # Measured 52.5 steps/food at 100% win on fresh 20x20 seeds vs ~96 for "cycle".
+        from safe_teacher import safe_shortcut_action
+        return safe_shortcut_action(
+            env, cycle_index, len(cycle), disable_fill=0.5, tail_margin=3
+        )
     raise ValueError(f"unknown teacher mode: {teacher_mode}")
 
 

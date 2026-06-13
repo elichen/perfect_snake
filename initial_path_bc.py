@@ -49,10 +49,8 @@ class InitialPathSampler:
         self.starts: list[tuple[int, int]] = []
         center = board_size // 2
         for direction in range(4):
-            self.env.snake = []
             dr, dc = self.env.DIRECTIONS[direction]
-            for idx in range(3):
-                self.env.snake.append((center - idx * dr, center - idx * dc))
+            self.env.snake = [(center - idx * dr, center - idx * dc) for idx in range(3)]
             self.env.direction = direction
             cycle_idx, head_idx = find_cycle_condition(self.env)
             if cycle_idx is None or head_idx is None:

@@ -201,6 +201,12 @@ def make_snake_env(
     n: int,
     gamma: float,
     alpha: float,
+    topology_penalty: float = 0.0,
+    topology_penalty_min_fill: float = 0.80,
+    tail_safety_penalty: float = 0.0,
+    tail_safety_min_fill: float = 0.80,
+    tail_safety_pbrs: float = 0.0,
+    tail_safety_pbrs_min_fill: float = 0.80,
     symmetric: bool = False,
     stall_penalty: float = -1.0,
     stall_terminates: bool = True,
@@ -243,6 +249,12 @@ def make_snake_env(
         n=n,
         gamma=gamma,
         alpha=alpha,
+        topology_penalty=topology_penalty,
+        topology_penalty_min_fill=topology_penalty_min_fill,
+        tail_safety_penalty=tail_safety_penalty,
+        tail_safety_min_fill=tail_safety_min_fill,
+        tail_safety_pbrs=tail_safety_pbrs,
+        tail_safety_pbrs_min_fill=tail_safety_pbrs_min_fill,
         seed=seed,
         stall_penalty=stall_penalty,
         stall_terminates=stall_terminates,
@@ -1427,6 +1439,23 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--alpha", type=float, default=0.2)
+    parser.add_argument("--topology-penalty", type=float, default=0.0,
+                        help="Negative reward when a surviving high-fill move strands free cells "
+                             "(splits free space). Scaled by stranded fraction. e.g. -0.15. 0=off")
+    parser.add_argument("--topology-penalty-min-fill", type=float, default=0.80,
+                        help="Fill fraction above which the topology penalty activates")
+    parser.add_argument("--tail-safety-penalty", type=float, default=0.0,
+                        help="Flat negative reward when a surviving high-fill move leaves the tail "
+                             "unreachable (binary viability signal). e.g. -0.15. 0=off")
+    parser.add_argument("--tail-safety-min-fill", type=float, default=0.80,
+                        help="Fill fraction above which the tail-safety penalty activates")
+    parser.add_argument("--tail-safety-pbrs", type=float, default=0.0,
+                        help="Potential-based tail-safety shaping: phi = this coef (negative, "
+                             "e.g. -0.3) while the tail is unreachable at high fill, else 0; "
+                             "reward += gamma*phi(s') - phi(s). Policy-invariant, unlike the "
+                             "flat --tail-safety-penalty. 0=off")
+    parser.add_argument("--tail-safety-pbrs-min-fill", type=float, default=0.80,
+                        help="Fill fraction above which the tail-safety PBRS potential activates")
     parser.add_argument(
         "--min-lr-ratio",
         type=float,
@@ -1714,6 +1743,12 @@ def main():
         n=args.board_size,
         gamma=args.gamma,
         alpha=args.alpha,
+        topology_penalty=args.topology_penalty,
+        topology_penalty_min_fill=args.topology_penalty_min_fill,
+        tail_safety_penalty=args.tail_safety_penalty,
+        tail_safety_min_fill=args.tail_safety_min_fill,
+        tail_safety_pbrs=args.tail_safety_pbrs,
+        tail_safety_pbrs_min_fill=args.tail_safety_pbrs_min_fill,
         symmetric=args.symmetric,
         stall_penalty=args.stall_penalty,
         stall_terminates=args.stall_terminates,

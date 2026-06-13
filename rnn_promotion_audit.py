@@ -48,6 +48,59 @@ def _parse_seeds(value: str) -> list[int]:
     return seeds
 
 
+def _flatten_ints(obj: Any) -> list[int]:
+    """Recursively collect every int found in a nested list/dict (ignores non-int leaves)."""
+    out: list[int] = []
+    if isinstance(obj, bool):
+        return out
+    if isinstance(obj, int):
+        return [obj]
+    if isinstance(obj, dict):
+        for v in obj.values():
+            out.extend(_flatten_ints(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            out.extend(_flatten_ints(v))
+    return out
+
+
+def _load_scar_seeds(path: Path) -> list[int]:
+    """Load the append-only scar seeds from experiments/seed_registry.json."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    scar = data.get("scar_seeds", {})
+    # Skip the ambiguous_review bucket (documented-but-unconfirmed) by default.
+    seeds = sorted({s for k, v in scar.items() if k != "ambiguous_review"
+                    for s in _flatten_ints(v)})
+    return seeds
+
+
+def _load_burned_ranges(path: Path) -> list[tuple[int, int]]:
+    """Parse burned_ranges keys like '20001-20100' into (start, end) inclusive tuples."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    ranges: list[tuple[int, int]] = []
+    for key in data.get("burned_ranges", {}):
+        if key.startswith("_"):
+            continue
+        if "-" in key:
+            a, b = key.split("-", 1)
+            try:
+                ranges.append((int(a), int(b)))
+            except ValueError:
+                continue
+    return ranges
+
+
+def _confidence_bound_95(episodes: int, failures: int) -> float | None:
+    """95% upper bound on the true failure rate. Rule of three for 0 failures."""
+    if episodes <= 0:
+        return None
+    if failures == 0:
+        return 3.0 / episodes
+    # Crude upper bound for >0 failures: observed rate + ~2 std (normal approx).
+    p = failures / episodes
+    return min(1.0, p + 2.0 * ((p * (1 - p) / episodes) ** 0.5))
+
+
 def _load_policy(args: argparse.Namespace) -> SnakeRNNPolicy:
     policy = SnakeRNNPolicy(
         board_size=args.board_size,
@@ -105,12 +158,24 @@ def main() -> int:
         help="Comma-separated start:count or name=start:count suites",
     )
     parser.add_argument("--hard-seeds", type=_parse_seeds, default=None)
+    parser.add_argument("--scar-file", type=Path, default=None,
+                        help="seed_registry.json: load append-only scar seeds (merged into hard-seeds) "
+                             "and burned ranges (for a contamination check)")
     parser.add_argument("--max-steps", type=int, default=100_000)
     parser.add_argument("--stop-after-failures", type=int, default=1)
     parser.add_argument("--max-mean-win-steps", type=float, default=None)
     parser.add_argument("--max-p95-win-steps", type=float, default=None)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
+
+    burned_ranges: list[tuple[int, int]] = []
+    if args.scar_file is not None:
+        scar = _load_scar_seeds(args.scar_file)
+        merged = sorted(set(args.hard_seeds or []) | set(scar))
+        print({"scar_file": str(args.scar_file), "scar_seeds_loaded": len(scar),
+               "hard_seeds_total": len(merged)}, flush=True)
+        args.hard_seeds = merged
+        burned_ranges = _load_burned_ranges(args.scar_file)
 
     policy = _load_policy(args)
     suites: list[dict[str, Any]] = []
@@ -172,6 +237,17 @@ def main() -> int:
             result for result in (mean_steps_passed, p95_steps_passed) if result is not None
         ]
         path_efficiency_passed = bool(configured_results) and all(configured_results)
+
+    evaluated = int(combined_summary["episodes"])
+    n_failures = len(combined_summary.get("failures", []))
+    failure_rate_95ci_upper = _confidence_bound_95(evaluated, n_failures)
+    # Contamination check: which audited suites overlap burned ranges. Regression suites
+    # are EXPECTED to overlap; a suite credited as a FRESH holdout must not.
+    burned_overlap_suites: list[str] = []
+    if burned_ranges:
+        for label, seeds in args.ranges:
+            if any(any(lo <= s <= hi for lo, hi in burned_ranges) for s in seeds):
+                burned_overlap_suites.append(label)
     checklist = {
         "pure_neural_policy": True,
         "deterministic_greedy_inference": True,
@@ -190,6 +266,9 @@ def main() -> int:
         "mean_steps_passed": mean_steps_passed,
         "p95_steps_passed": p95_steps_passed,
         "path_efficiency_passed": path_efficiency_passed,
+        "failures_observed": n_failures,
+        "failure_rate_95ci_upper": failure_rate_95ci_upper,
+        "burned_overlap_suites": burned_overlap_suites,
         "promotion_passed": reliability_passed and path_efficiency_passed is not False,
     }
     payload = {

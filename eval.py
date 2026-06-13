@@ -653,6 +653,21 @@ def evaluate_checkpoint(
     reasons = []
     death_reasons = {}
 
+    # Fill-stratified efficiency (GOAL.md yardstick): steps and foods accumulated
+    # while the pre-step fill sits in each bucket, across all episodes.
+    fill_bucket_edges = (0.0, 0.5, 0.8, 0.95, 1.01)
+    fill_bucket_names = ("0_50", "50_80", "80_95", "95_100")
+    fill_bucket_steps = [0, 0, 0, 0]
+    fill_bucket_foods = [0, 0, 0, 0]
+    board_area_f = float(board_size * board_size)
+
+    def _fill_bucket(length: int) -> int:
+        fill = length / board_area_f
+        for b in range(4):
+            if fill < fill_bucket_edges[b + 1]:
+                return b
+        return 3
+
     if verbose or num_envs <= 1:
         env = SnakeEnv(
             n=board_size,
@@ -698,7 +713,12 @@ def evaluate_checkpoint(
                     action = int(torch.argmax(logits, dim=-1).item())
                 else:
                     action = int(torch.distributions.Categorical(logits=logits).sample().item())
+                pre_len = env.snake_length
                 obs, _, terminated, truncated, last_info = env.step(action)
+                bucket = _fill_bucket(pre_len)
+                fill_bucket_steps[bucket] += 1
+                if int(last_info.get("length", pre_len)) > pre_len:
+                    fill_bucket_foods[bucket] += 1
                 done = terminated or truncated
                 steps += 1
 
@@ -779,7 +799,12 @@ def evaluate_checkpoint(
                 batch_actions = torch.distributions.Categorical(logits=logits).sample().cpu().numpy()
 
             for slot, action in zip(active_indices, batch_actions):
+                pre_len = envs[slot].snake_length
                 obs, _, terminated, truncated, info = envs[slot].step(int(action))
+                bucket = _fill_bucket(pre_len)
+                fill_bucket_steps[bucket] += 1
+                if int(info.get("length", pre_len)) > pre_len:
+                    fill_bucket_foods[bucket] += 1
                 episode_steps[slot] += 1
 
                 if terminated or truncated:
@@ -829,12 +854,28 @@ def evaluate_checkpoint(
         "win_rate": float(wins / episodes),
         "wins": wins,
         "mean_length": float(np.mean(lengths)),
+        "steps_per_food": float(sum(lengths) / max(1, sum(scores))),
+        "mean_win_steps": (
+            float(np.mean([l for l, s in zip(lengths, scores) if s >= perfect_score]))
+            if wins > 0 else None
+        ),
+        "p95_win_steps": (
+            float(np.percentile([l for l, s in zip(lengths, scores) if s >= perfect_score], 95))
+            if wins > 0 else None
+        ),
         "death_lengths": death_lengths,
         "mean_death_length": float(np.mean(death_lengths)),
         "median_death_length": float(np.median(death_lengths)),
         "death_reasons": death_reasons,
         "death_fill_buckets": bucket_counts,
         "board_area": board_area,
+        "fill_bucket_steps": fill_bucket_steps,
+        "fill_bucket_foods": fill_bucket_foods,
+        "steps_per_food_by_fill": {
+            name: (float(fill_bucket_steps[b] / fill_bucket_foods[b])
+                   if fill_bucket_foods[b] > 0 else None)
+            for b, name in enumerate(fill_bucket_names)
+        },
     }
     stats.update(
         summarize_phase_metrics(

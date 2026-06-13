@@ -53,6 +53,12 @@ class SnakeEnv(gym.Env):
         gamma: float = 0.995,
         alpha: float = 0.2,
         survival_bonus: float = 0.0,
+        topology_penalty: float = 0.0,
+        topology_penalty_min_fill: float = 0.80,
+        tail_safety_penalty: float = 0.0,
+        tail_safety_min_fill: float = 0.80,
+        tail_safety_pbrs: float = 0.0,
+        tail_safety_pbrs_min_fill: float = 0.80,
         seed: Optional[int] = None,
         stall_penalty: float = -1.0,
         stall_terminates: bool = True,
@@ -92,6 +98,12 @@ class SnakeEnv(gym.Env):
         self.gamma = gamma
         self.alpha = alpha
         self.survival_bonus = survival_bonus
+        self.topology_penalty = topology_penalty
+        self.topology_penalty_min_fill = topology_penalty_min_fill
+        self.tail_safety_penalty = tail_safety_penalty
+        self.tail_safety_min_fill = tail_safety_min_fill
+        self.tail_safety_pbrs = tail_safety_pbrs
+        self.tail_safety_pbrs_min_fill = tail_safety_pbrs_min_fill
         self.stall_penalty = stall_penalty
         self.stall_terminates = stall_terminates
         self.flood_fill_obs = flood_fill_obs
@@ -171,17 +183,45 @@ class SnakeEnv(gym.Env):
             self._walls[:, 0] = 1.0
             self._walls[:, -1] = 1.0
 
+        # Body occupancy grid (includes head), maintained incrementally by step()
+        # and rebuilt on reset/restore. Single source for collision checks, the body
+        # obs channel, food placement, and the flood-fill passable mask.
+        self._occ = np.zeros((n, n), dtype=bool)
+        # Precomputed 4-connectivity structure + label output buffer for flood fill
+        # (avoids scipy generate_binary_structure + an allocation per call).
+        self._ff_structure = np.array(
+            [[False, True, False], [True, True, True], [False, True, False]]
+        )
+        self._ff_labels = np.zeros((n, n), dtype=np.int32)
+        # Per-state flood-fill cache: obs, penalties, and tail-safety all need the
+        # same reachability map. Invalidated at step() entry and on reset/restore.
+        self._ff_cache: Optional[np.ndarray] = None
+
         # Game state (initialized in reset)
-        self.snake: list[Tuple[int, int]] = []
+        self._snake: list[Tuple[int, int]] = []
         self.direction: int = 0
         self.food_pos: Tuple[int, int] = (0, 0)
         self.steps_since_food: int = 0
         self.score: int = 0
         self.prev_phi: float = 0.0
+        self.prev_tail_phi: float = 0.0
         self.total_steps: int = 0
         self._curriculum_cycles = self._build_curriculum_cycles()
         self._curriculum_cycle: Optional[list[Tuple[int, int]]] = None
         self._curriculum_head_idx: Optional[int] = None
+
+    @property
+    def snake(self) -> list[Tuple[int, int]]:
+        return self._snake
+
+    @snake.setter
+    def snake(self, value: list[Tuple[int, int]]) -> None:
+        # Rebuild the occupancy grid on assignment so external scripts that set
+        # env.snake directly stay consistent. In-place mutation (insert/pop/append)
+        # bypasses this; step() maintains occ itself and reset() rebuilds explicitly.
+        self._snake = list(value)
+        self._rebuild_occ()
+        self._ff_cache = None
 
     @property
     def snake_head(self) -> Tuple[int, int]:
@@ -206,33 +246,88 @@ class SnakeEnv(gym.Env):
         d_norm = d / max_d if max_d > 0 else 0.0
         return -self.alpha * d_norm
 
+    def _rebuild_occ(self) -> None:
+        self._occ[:] = False
+        for r, c in self.snake:
+            self._occ[r, c] = True
+
     def _place_food(self) -> None:
-        snake_set = set(self.snake)
-        empty_cells = [
-            (r, c)
-            for r in range(self.n)
-            for c in range(self.n)
-            if (r, c) not in snake_set
-        ]
-        if empty_cells:
-            idx = self.rng.integers(len(empty_cells))
-            self.food_pos = empty_cells[idx]
+        # Row-major order over empty cells matches the original list comprehension,
+        # so the same RNG draw selects the same cell.
+        empty_flat = np.flatnonzero(~self._occ.ravel())
+        if empty_flat.size:
+            idx = self.rng.integers(empty_flat.size)
+            flat = int(empty_flat[idx])
+            self.food_pos = (flat // self.n, flat % self.n)
         else:
             # Grid is full (game won)
             self.food_pos = (-1, -1)
 
+    def _tail_reachable(self) -> bool:
+        """Can the head reach its own tail through free cells (tail treated as a
+        passable goal, since it vacates as the snake moves)?
+
+        If yes, the snake can always survive by following its tail — the core
+        space-filling viability invariant. This is a binary, survival-relevant signal,
+        unlike a stranded-cell count, so penalizing its loss does not push the policy
+        toward blunt boundary-avoidance.
+        """
+        if len(self.snake) < 2:
+            return True
+        hr, hc = self.snake[0]
+        tr, tc = self.snake[-1]
+        if abs(tr - hr) + abs(tc - hc) == 1:
+            return True
+        # Tail is reachable iff a free neighbor of the tail sits in the head's
+        # flood-fill component (the cached map the obs computes anyway).
+        ff = self._flood_fill()
+        n = self.n
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nr, nc = tr + dr, tc + dc
+            if 0 <= nr < n and 0 <= nc < n and ff[nr, nc] == 1.0:
+                return True
+        return False
+
+    def _tail_reachable_bfs(self) -> bool:
+        """Reference BFS implementation (kept for equivalence testing)."""
+        if len(self.snake) < 2:
+            return True
+        from collections import deque
+
+        n = self.n
+        head = self.snake[0]
+        tail = self.snake[-1]
+        body = set(self.snake)
+        seen = {head}
+        q = deque([head])
+        while q:
+            r, c = q.popleft()
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < n and 0 <= nc < n):
+                    continue
+                cell = (nr, nc)
+                if cell == tail:
+                    return True
+                if cell in body or cell in seen:
+                    continue
+                seen.add(cell)
+                q.append(cell)
+        return False
+
     def _flood_fill(self) -> np.ndarray:
-        """Flood-fill reachability from head using scipy connected components."""
+        """Flood-fill reachability from head (cached per state)."""
+        if self._ff_cache is None:
+            self._ff_cache = self._flood_fill_compute()
+        return self._ff_cache
+
+    def _flood_fill_compute(self) -> np.ndarray:
         from scipy.ndimage import label
 
         n = self.n
-        # Build passable grid (1 = empty, 0 = body)
-        passable = np.ones((n, n), dtype=np.int32)
-        for r, c in self.snake:
-            passable[r, c] = 0
-
-        # Label connected components
-        labels, _ = label(passable)
+        # Label connected components of the passable (non-body) cells
+        label(~self._occ, structure=self._ff_structure, output=self._ff_labels)
+        labels = self._ff_labels
 
         # Find which components are reachable from head (head is on body, check neighbors)
         hr, hc = self.snake_head
@@ -340,8 +435,7 @@ class SnakeEnv(gym.Env):
         obs[0, hr + 1, hc + 1] = 1.0
 
         # Channel 1: Body (includes head)
-        for r, c in self.snake:
-            obs[1, r + 1, c + 1] = 1.0
+        obs[1, 1:-1, 1:-1] = self._occ
 
         # Channel 2: Food
         fr, fc = self.food_pos
@@ -410,12 +504,20 @@ class SnakeEnv(gym.Env):
         hr, hc = self.snake_head
         c = self.obs_n // 2  # center index (19 for 39x39)
 
+        # Overlap between the head-centered window and the board (board always fits)
+        gr_start = max(0, c - hr)
+        gc_start = max(0, c - hc)
+        br_start = max(0, hr - c)
+        bc_start = max(0, hc - c)
+        bh = min(self.n - br_start, self.obs_n - gr_start)
+        bw = min(self.n - bc_start, self.obs_n - gc_start)
+
         # Channel 0: Head (always at center)
         obs[0, c, c] = 1.0
 
         # Channel 1: Body (includes head)
-        for r, col in self.snake:
-            obs[1, r - hr + c, col - hc + c] = 1.0
+        obs[1, gr_start:gr_start + bh, gc_start:gc_start + bw] = \
+            self._occ[br_start:br_start + bh, bc_start:bc_start + bw]
 
         # Channel 2: Food
         fr, fc = self.food_pos
@@ -425,24 +527,16 @@ class SnakeEnv(gym.Env):
         # Channel 3: Normalized length (broadcast)
         obs[3, :, :] = self.snake_length / float(self.n * self.n)
 
-        # Channel 4: Walls (everything outside the board)
-        row_board = np.arange(self.obs_n) + hr - c
-        col_board = np.arange(self.obs_n) + hc - c
-        obs[4] = ((row_board < 0) | (row_board >= self.n))[:, None] | \
-                  ((col_board < 0) | (col_board >= self.n))[None, :]
+        # Channel 4: Walls (everything outside the board; the board rectangle always
+        # fits fully inside the head-centered window)
+        obs[4] = 1.0
+        obs[4, gr_start:gr_start + bh, gc_start:gc_start + bw] = 0.0
 
         # Channel 5: Flood-fill reachability
         if self.flood_fill_obs and self.flood_fill_channel is not None:
             ff = self._flood_fill()
-            # Compute overlap between grid and board
-            gr_start = max(0, c - hr)
-            gc_start = max(0, c - hc)
-            br_start = max(0, hr - c)
-            bc_start = max(0, hc - c)
-            h = min(self.n - br_start, self.obs_n - gr_start)
-            w = min(self.n - bc_start, self.obs_n - gc_start)
-            obs[self.flood_fill_channel, gr_start:gr_start+h, gc_start:gc_start+w] = \
-                ff[br_start:br_start+h, bc_start:bc_start+w]
+            obs[self.flood_fill_channel, gr_start:gr_start + bh, gc_start:gc_start + bw] = \
+                ff[br_start:br_start + bh, bc_start:bc_start + bw]
 
         if self.body_age_obs and self.body_age_obs_channel is not None:
             body_age = self._body_age_map(self.body_age_obs_min_fill)
@@ -526,7 +620,8 @@ class SnakeEnv(gym.Env):
             stacked_base = base
 
         obs = stacked_base if aux is None else np.concatenate([stacked_base, aux], axis=0)
-        self._obs_history_frames.appendleft(base.copy())
+        if self.obs_history > 1:
+            self._obs_history_frames.appendleft(base.copy())
         return obs
 
     def _build_hamiltonian_cycle(self) -> list[Tuple[int, int]]:
@@ -650,12 +745,20 @@ class SnakeEnv(gym.Env):
                 c = max(0, min(self.n - 1, c))
                 self.snake.append((r, c))
 
+        self._rebuild_occ()
         self._place_food()
 
         self.steps_since_food = 0
         self.score = max(0, self.snake_length - 3)
         self.total_steps = 0
         self.prev_phi = self._compute_phi()
+        self.prev_tail_phi = 0.0
+        if self.tail_safety_pbrs != 0.0:
+            if (
+                self.snake_length / float(self.n * self.n) >= self.tail_safety_pbrs_min_fill
+                and not self._tail_reachable()
+            ):
+                self.prev_tail_phi = self.tail_safety_pbrs
         self._obs_history_frames.clear()
         self._action_history.clear()
 
@@ -670,6 +773,7 @@ class SnakeEnv(gym.Env):
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         self.total_steps += 1
+        self._ff_cache = None
 
         # Map relative action to absolute direction
         delta = {0: -1, 1: 0, 2: 1}
@@ -722,22 +826,18 @@ class SnakeEnv(gym.Env):
             terminated = True
             base_reward = -1.0
             reason = "wall"
-        # Check self collision (excluding tail if it will move)
-        elif new_head in self.snake[:-1]:
-            terminated = True
-            base_reward = -1.0
-            reason = "self"
-        # Check if tail stays (only if eating food, tail won't move)
-        elif new_head == self.snake[-1] and new_head != self.food_pos:
-            pass
-        elif new_head in self.snake:
-            terminated = True
-            base_reward = -1.0
-            reason = "self"
+        elif self._occ[new_head]:
+            # Moving into the tail cell is safe only when the tail vacates this
+            # step (i.e. not eating); every other occupied cell is a self collision.
+            if new_head != self.snake[-1] or new_head == self.food_pos:
+                terminated = True
+                base_reward = -1.0
+                reason = "self"
 
         if not terminated:
             if new_head == self.food_pos:
                 self.snake.insert(0, new_head)
+                self._occ[new_head] = True
                 self.score += 1
                 self.steps_since_food = 0
                 base_reward = 1.0
@@ -749,7 +849,9 @@ class SnakeEnv(gym.Env):
                     self._place_food()
             else:
                 self.snake.insert(0, new_head)
-                self.snake.pop()
+                old_tail = self.snake.pop()
+                self._occ[old_tail] = False
+                self._occ[new_head] = True
                 self.steps_since_food += 1
 
             if followed_cycle and self._curriculum_head_idx is not None:
@@ -763,6 +865,50 @@ class SnakeEnv(gym.Env):
             base_reward += self.stall_penalty
             reason = "stall"
 
+        # Topology penalty: at high fill, punish a surviving move that strands free
+        # cells (splits the free space so the head can no longer reach part of it).
+        # That stranding is the self-trap, set a few moves before death — penalizing it
+        # at its cause gives the dense endgame-discipline signal RL otherwise lacks.
+        topo_penalty = 0.0
+        if (
+            not terminated
+            and self.topology_penalty != 0.0
+            and self.snake_length / float(self.n * self.n) >= self.topology_penalty_min_fill
+        ):
+            reachable = float(np.sum(self._flood_fill()))
+            total_free = float(self.n * self.n - self.snake_length)
+            if total_free > 0:
+                stranded_frac = max(0.0, (total_free - reachable) / total_free)
+                topo_penalty = self.topology_penalty * stranded_frac
+
+        # Tail-safety penalty: at high fill, a flat penalty for a surviving move that
+        # leaves the tail unreachable (a move that survives now but dooms the snake).
+        # Binary and survival-relevant; the cleaner replacement for topology_penalty.
+        tail_pen = 0.0
+        if (
+            not terminated
+            and self.tail_safety_penalty != 0.0
+            and self.snake_length / float(self.n * self.n) >= self.tail_safety_min_fill
+        ):
+            if not self._tail_reachable():
+                tail_pen = self.tail_safety_penalty
+
+        # Tail-safety PBRS: potential phi = coef (negative) while the tail is
+        # unreachable at high fill, else 0. The shaped term gamma*phi(s') - phi(s)
+        # charges entry into an unreachable state and refunds recovery, telescoping
+        # to ~0 along surviving paths — unlike the flat penalty, it cannot reshape
+        # the mid-game value landscape (Ng et al. policy invariance).
+        tail_pbrs = 0.0
+        if self.tail_safety_pbrs != 0.0 and not terminated:
+            phi_tail = 0.0
+            if (
+                self.snake_length / float(self.n * self.n) >= self.tail_safety_pbrs_min_fill
+                and not self._tail_reachable()
+            ):
+                phi_tail = self.tail_safety_pbrs
+            tail_pbrs = self.gamma * phi_tail - self.prev_tail_phi
+            self.prev_tail_phi = phi_tail
+
         if not terminated:
             phi = self._compute_phi()
             r_shape = self.gamma * phi - self.prev_phi
@@ -773,7 +919,7 @@ class SnakeEnv(gym.Env):
         if terminated and reason != "win":
             reward = base_reward
         else:
-            reward = base_reward + r_shape + self.survival_bonus + follow_bonus + safe_action_bonus
+            reward = base_reward + r_shape + self.survival_bonus + follow_bonus + safe_action_bonus + topo_penalty + tail_pen + tail_pbrs
 
         if self.action_history_obs > 0:
             self._action_history.appendleft(int(action))
@@ -795,6 +941,7 @@ class SnakeEnv(gym.Env):
             self.steps_since_food,
             self.score,
             self.prev_phi,
+            self.prev_tail_phi,
             self.total_steps,
             self._curriculum_cycle,
             self._curriculum_head_idx,
@@ -811,6 +958,7 @@ class SnakeEnv(gym.Env):
             steps_since_food,
             score,
             prev_phi,
+            prev_tail_phi,
             total_steps,
             curriculum_cycle,
             curriculum_head_idx,
@@ -824,6 +972,7 @@ class SnakeEnv(gym.Env):
         self.steps_since_food = steps_since_food
         self.score = score
         self.prev_phi = prev_phi
+        self.prev_tail_phi = prev_tail_phi
         self.total_steps = total_steps
         self._curriculum_cycle = curriculum_cycle
         self._curriculum_head_idx = curriculum_head_idx

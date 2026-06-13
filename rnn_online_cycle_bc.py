@@ -359,7 +359,7 @@ def main() -> int:
     parser.add_argument("--fill-input", action="store_true")
     parser.add_argument(
         "--teacher-mode",
-        choices=["hamiltonian", "cycle", "grid_path", "grid_shortest", "tail_path"],
+        choices=["hamiltonian", "cycle", "safe", "grid_path", "grid_shortest", "tail_path"],
         default="hamiltonian",
     )
     parser.add_argument("--max-plan-nodes", type=int, default=2000)
